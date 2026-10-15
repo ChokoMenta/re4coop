@@ -15,3 +15,4 @@ add_library(dinput8 SHARED
 
 set_target_properties(dinput8 PROPERTIES PREFIX "" OUTPUT_NAME "dinput8")
 target_compile_definitions(dinput8 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(dinput8 PRIVATE ws2_32)

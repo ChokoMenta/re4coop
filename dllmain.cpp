@@ -4,6 +4,7 @@
 // control/teclado sigan funcionando normal. Ademas lanzamos nuestro propio hilo.
 
 #include <windows.h>
+#include <unknwn.h>
 
 void ModMain(); // definido en mod.cpp
 

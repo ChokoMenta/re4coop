@@ -1,0 +1,23 @@
+name: Compilar mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar (32 bits)
+        run: cmake -S . -B build -A Win32
+
+      - name: Compilar
+        run: cmake --build build --config Release
+
+      - name: Subir el dinput8.dll resultante
+        uses: actions/upload-artifact@v4
+        with:
+          name: re4coop-dinput8
+          path: build/Release/dinput8.dll

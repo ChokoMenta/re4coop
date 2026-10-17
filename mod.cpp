@@ -856,6 +856,29 @@ static bool SafeMatUpdate(uintptr_t em)
 
 // ?El puntero del fantasma sigue siendo un personaje vivo del juego?
 // (el juego destruye a todos los personajes al cambiar de sala)
+// Resumen de estado interno de un personaje (para el log): rutinas, animacion, vida y flags de estado.
+static void DescribeEm(uintptr_t em, char* buf, size_t bufSize)
+{
+	uint8_t r1 = 0, r2 = 0, r3 = 0;
+	float frame = 0, frameMax = 0;
+	uint16_t motState = 0;
+	int16_t hp = 0;
+	uint32_t st3cc = 0, f3d0 = 0, f3e8 = 0;
+	SafeRead(em + 0xFD, &r1, 1);
+	SafeRead(em + 0xFE, &r2, 1);
+	SafeRead(em + 0xFF, &r3, 1);
+	SafeRead(em + 0x1D8 + 0x24, &frame, 4);      // MOTION_INFO::Mot_frame_24
+	SafeRead(em + 0x1D8 + 0x20, &frameMax, 4);   // MOTION_INFO::Mot_frame_max_20
+	SafeRead(em + 0x1D8 + 0x42, &motState, 2);   // MOTION_INFO::Mot_state_42
+	SafeRead(em + 0x324, &hp, 2);                // cEm::hp_324
+	SafeRead(em + 0x3CC, &st3cc, 4);             // cEm::m_StatusFlag_3CC
+	SafeRead(em + 0x3D0, &f3d0, 4);              // cEm::flag_3D0
+	SafeRead(em + 0x3E8, &f3e8, 4);              // cEm::flags_3E8
+	snprintf(buf, bufSize, "r1=%u r2=%u r3=%u anim=%.1f/%.1f estado_anim=%u hp=%d status=0x%08X f3D0=0x%08X f3E8=0x%08X",
+		(unsigned)r1, (unsigned)r2, (unsigned)r3, frame, frameMax, (unsigned)motState, (int)hp,
+		(unsigned)st3cc, (unsigned)f3d0, (unsigned)f3e8);
+}
+
 static bool GhostValid()
 {
 	if (!g_ghost.em || !g_emMgr)
@@ -1379,7 +1402,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3c (v3) iniciado");
+	Log("RE4 Coop - hito 3d (v3b) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
@@ -1561,6 +1584,9 @@ void ModMain()
 			Log("Leon    @0x%08X pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X flags=0x%08X hp=%d r0=%u",
 				(unsigned)leon.obj, leon.pos[0], leon.pos[1], leon.pos[2], leon.angY, (unsigned)ReadRoomNow(),
 				(unsigned)lFlags, (int)lHp, (unsigned)lR0);
+			char det[240];
+			DescribeEm(leon.obj, det, sizeof(det));
+			Log("  Leon detalle: %s", det);
 			if (g_ghost.em)
 			{
 				uint32_t gFlags = 0;
@@ -1570,6 +1596,8 @@ void ModMain()
 				float ddx = g_ghost.pos[0] - leon.pos[0], ddz = g_ghost.pos[2] - leon.pos[2];
 				Log("Fantasma flags=0x%08X r0=%u distancia_a_Leon=%.0f reactivaciones=%d",
 					(unsigned)gFlags, (unsigned)gR0, sqrtf(ddx * ddx + ddz * ddz), g_ghost.reFrozen);
+				DescribeEm(g_ghost.em, det, sizeof(det));
+				Log("  Fantasma detalle: %s", det);
 			}
 		}
 		else if (lastLeonValid)

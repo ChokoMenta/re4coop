@@ -1,4 +1,4 @@
-// RE4 Coop - hito 3: el "fantasma" del otro jugador.
+// RE4 Coop - hito 3b: el "fantasma" del otro jugador (version segura).
 //
 // Que hace (ademas de lo del hito 2: conexion UDP y envio de la posicion):
 //  1. Envia tambien en que sala esta cada jugador (las coordenadas solo valen dentro de la misma sala).
@@ -7,8 +7,11 @@
 //  3. Con F8 se enciende/apaga el fantasma: un personaje extra, creado con la propia funcion del
 //     juego (EmSetEvent, la misma que usa re4_tweaks), que se mueve a donde esta el otro jugador.
 //     Por ahora queda congelado (sin animacion ni IA): es un muneco que se desliza.
-//  4. Con F9 se cambia el modelo del fantasma (no todos los modelos estan cargados en todas las salas,
-//     por eso se puede probar uno por uno).
+//  4. Con F9 se cambia el modelo del fantasma.
+//
+// Cambio del hito 3b: en el hito 3 el juego se colgo al pedirle un modelo que no estaba cargado en la sala.
+// Ahora el mod SOLO crea el modelo de un enemigo que ya esta vivo en la sala, y arma la estructura
+// copiando la entrada real de ese enemigo en la lista de la sala. F9 cambia entre esos modelos disponibles.
 //
 // Los patrones de bytes y las estructuras salen del proyecto re4_tweaks (nipkownix/re4_tweaks, licencia zlib).
 
@@ -269,9 +272,11 @@ static bool ReadPlayer(uintptr_t globalPtrAddr, PlayerInfo* out)
 	}
 }
 
+// Mientras el juego carga, la posicion de Leon puede ser cero o valores minimos (en los logs del hito 3
+// aparecio "en juego" con pos=(0.0, 0.0, 0.0)): todo lo que este practicamente en el origen no cuenta.
 static bool IsZeroPos(const float* p)
 {
-	return p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f;
+	return fabsf(p[0]) < 1.0f && fabsf(p[1]) < 1.0f && fabsf(p[2]) < 1.0f;
 }
 
 // ---------------------------------------------------------------- datos globales del juego
@@ -306,6 +311,7 @@ struct Config
 	bool ghostOnStart;     // [fantasma] activo
 	int modelId;           // [fantasma] modelo
 	bool updateMatrix;     // [fantasma] actualizar_matriz
+	bool killOnHang;       // [fantasma] cerrar_si_se_cuelga
 };
 
 static void WriteDefaultConfig(const char* path)
@@ -344,6 +350,7 @@ static bool LoadConfig(Config& cfg)
 	// Opciones del fantasma (opcionales: si faltan en el .ini se usan estos valores).
 	cfg.ghostOnStart = GetPrivateProfileIntA("fantasma", "activo", 0, path) != 0;
 	cfg.updateMatrix = GetPrivateProfileIntA("fantasma", "actualizar_matriz", 1, path) != 0;
+	cfg.killOnHang = GetPrivateProfileIntA("fantasma", "cerrar_si_se_cuelga", 1, path) != 0;
 	char modelText[32];
 	GetPrivateProfileStringA("fantasma", "modelo", "0x10", modelText, sizeof(modelText), path);
 	cfg.modelId = (int)strtoul(modelText, nullptr, 0);
@@ -375,8 +382,9 @@ static bool LoadConfig(Config& cfg)
 		return false;
 	}
 
-	Log("Configuracion: modo=%s ip='%s' puerto=%d | fantasma: activo=%d modelo=0x%02X matriz=%d",
-		cfg.isHost ? "host" : "client", cfg.ip, cfg.port, cfg.ghostOnStart ? 1 : 0, cfg.modelId, cfg.updateMatrix ? 1 : 0);
+	Log("Configuracion: modo=%s ip='%s' puerto=%d | fantasma: activo=%d modelo=0x%02X matriz=%d cerrar_si_se_cuelga=%d",
+		cfg.isHost ? "host" : "client", cfg.ip, cfg.port, cfg.ghostOnStart ? 1 : 0, cfg.modelId, cfg.updateMatrix ? 1 : 0,
+		cfg.killOnHang ? 1 : 0);
 	return true;
 }
 
@@ -602,70 +610,46 @@ static RemoteSnap GetRemoteSnap()
 
 // ---------------------------------------------------------------- el fantasma
 
-// Modelos que se pueden probar con F9. El primero es el predeterminado.
-// (ids de personaje del juego, segun la tabla de re4_tweaks)
-// NO se incluyen 0x00 (jugador) ni Ashley (0x03, 0x05, 0x0C): crearlos podria pisar los
-// punteros de Leon/Ashley del juego.
-struct ModelOpt
+// Modelos que el mod acepta para el fantasma (ids de personaje del juego, segun la tabla de re4_tweaks):
+// solo personajes humanoides comunes. Quedan afuera el jugador (0x00), Ashley (0x03, 0x05, 0x0C: crearla
+// podria pisar los punteros de Ashley del juego), los jefes, los comerciantes y los vehiculos.
+// Aun estando en esta lista, un modelo solo se usa si ya hay un enemigo igual vivo en la sala.
+struct ModelInfo
 {
 	uint8_t id;
 	const char* name;
 };
-static const ModelOpt kModels[] = {
+static const ModelInfo kAllowed[] = {
 	{ 0x10, "Ganado" },
+	{ 0x11, "Zealot" },
+	{ 0x12, "Ganado" },
+	{ 0x15, "Ganado" },
+	{ 0x16, "Ganado" },
+	{ 0x17, "Ganado" },
+	{ 0x19, "Zealot" },
+	{ 0x1A, "Zealot" },
 	{ 0x1F, "Soldado" },
+	{ 0x42, "Ganado (Separate Ways)" },
+	{ 0x43, "Soldado (Separate Ways)" },
+	{ 0x44, "Ganado (Separate Ways)" },
 	{ 0x02, "Leon (de eventos)" },
 	{ 0x04, "Luis" },
-	{ 0x39, "Krauser" },
-	{ 0x21, "Perro" },
 };
-static const int kModelMax = 16;
-static uint8_t g_modelIds[kModelMax];
-static const char* g_modelNames[kModelMax];
-static int g_modelCount = 0;
-static int g_modelIndex = 0;
 
-static bool IsForbiddenModel(int id)
+static bool IsAllowedModel(int id)
 {
-	return id <= 0 || id > 0x61 || id == 0x03 || id == 0x05 || id == 0x0C;
+	for (const ModelInfo& m : kAllowed)
+		if (m.id == id)
+			return true;
+	return false;
 }
 
-static void BuildModelList(int cfgModel)
+static const char* ModelName(int id)
 {
-	g_modelCount = 0;
-
-	// Si el .ini pide un modelo que no esta en la lista, va primero.
-	bool inList = false;
-	for (const ModelOpt& m : kModels)
-		if (m.id == cfgModel)
-			inList = true;
-
-	if (!inList)
-	{
-		if (IsForbiddenModel(cfgModel))
-			Log("AVISO: modelo=0x%02X del .ini no esta permitido, se usa 0x10", cfgModel);
-		else
-		{
-			g_modelIds[g_modelCount] = (uint8_t)cfgModel;
-			g_modelNames[g_modelCount] = "personalizado (.ini)";
-			g_modelCount++;
-		}
-	}
-
-	for (const ModelOpt& m : kModels)
-	{
-		if (g_modelCount >= kModelMax)
-			break;
-		g_modelIds[g_modelCount] = m.id;
-		g_modelNames[g_modelCount] = m.name;
-		g_modelCount++;
-	}
-
-	// Empezar por el modelo pedido en el .ini.
-	g_modelIndex = 0;
-	for (int i = 0; i < g_modelCount; i++)
-		if (g_modelIds[i] == cfgModel)
-			g_modelIndex = i;
+	for (const ModelInfo& m : kAllowed)
+		if (m.id == id)
+			return m.name;
+	return "?";
 }
 
 // Funcion del juego que crea un personaje a partir de una estructura EM_LIST (0x20 bytes).
@@ -706,6 +690,138 @@ static bool g_updateMatrix = true;
 static int g_spawnFails = 0;
 static DWORD g_holdUntil = 0;
 static uint16_t g_lastRoom = 0xFFFF;
+
+// ---- modelos disponibles en la sala ----
+// Una "candidata" es un enemigo que YA esta vivo en la sala: si existe, su modelo esta cargado y se puede
+// crear otro igual sin riesgo. De ese enemigo se copia su entrada en la lista de la sala (GLOBAL_WK::Em_list_5410:
+// 256 entradas de 0x20 bytes), que es una estructura EM_LIST completa y valida.
+static const uintptr_t EM_LISTIDX = 0x3A0;   // cEm::emListIndex_3A0 (255 = no viene de la lista de la sala)
+static const uintptr_t G_EMLIST = 0x5410;    // GLOBAL_WK::Em_list_5410
+static const int EMLIST_COUNT = 256;
+static const int EMLIST_SIZE = 0x20;
+
+struct Candidate
+{
+	uint8_t id;
+	int liveCount;                 // cuantos enemigos asi hay vivos
+	int listIndex;                 // de que entrada de la lista se copio
+	uint8_t templ[EMLIST_SIZE];    // copia de esa entrada
+};
+static const int kCandMax = 16;
+static Candidate g_cands[kCandMax];
+static int g_candCount = 0;
+static int g_candIndex = 0;        // el elegido con F9
+static uint8_t g_wantedId = 0x10;  // modelo preferido (re4coop.ini o ultimo elegido con F9)
+static uint32_t g_candSig = 0;     // para anotar en el log solo cuando cambia la lista
+static bool g_warnedNoCand = false;
+
+// Mientras el juego esta dentro de una llamada arriesgada (crear el personaje o actualizar su matriz), el hilo
+// del mod ve que g_riskStart != 0 y, si pasan mas de 7 segundos, lo anota en el log y (si esta activado)
+// cierra el juego, para que no haya que reiniciar la PC.
+static volatile DWORD g_riskStart = 0;
+static volatile int g_riskCode = 0;   // 1 = EmSetEvent (crear el personaje), 2 = matUpdate (actualizar su matriz)
+static volatile int g_riskId = 0;     // modelo involucrado
+static bool g_killOnHang = true;
+
+// Recorre la lista de personajes del juego y arma la lista de modelos disponibles (solo en el hilo del juego).
+static void ScanCandidates()
+{
+	Candidate found[kCandMax];
+	int n = 0;
+
+	uintptr_t g = 0;
+	uint32_t arr = 0, cnt = 0, size = 0;
+	if (!g_pGvar || !g_emMgr || !SafeRead(g_pGvar, &g, 4) || g < 0x10000)
+		return;
+	if (!SafeRead(g_emMgr + 4, &arr, 4) || !SafeRead(g_emMgr + 8, &cnt, 4) || !SafeRead(g_emMgr + 0xC, &size, 4))
+		return;
+	if (arr == 0 || cnt == 0 || cnt > 4096 || size < 0x408 || size > 0x4000)
+		return;
+
+	for (uint32_t j = 0; j < cnt && n < kCandMax; j++)
+	{
+		uintptr_t em = (uintptr_t)arr + (uintptr_t)j * size;
+		if (em == g_ghost.em)
+			continue; // el propio fantasma no cuenta
+
+		uint32_t flags = 0;
+		uint8_t id = 0, li = 0;
+		if (!SafeRead(em + EM_FLAGS, &flags, 4) || (flags & FLAG_VALID_MASK) == 0)
+			continue;
+		if (!SafeRead(em + EM_ID, &id, 1) || !SafeRead(em + EM_LISTIDX, &li, 1))
+			continue;
+		// 255 = el enemigo no viene de la lista de la sala (incluye a nuestros propios fantasmas).
+		if (!IsAllowedModel(id) || li >= EMLIST_COUNT - 1)
+			continue;
+
+		uint8_t templ[EMLIST_SIZE];
+		if (!SafeRead(g + G_EMLIST + (uintptr_t)li * EMLIST_SIZE, templ, EMLIST_SIZE))
+			continue;
+		if (templ[1] != id)
+			continue; // la entrada de la lista no coincide con el enemigo: no es confiable
+
+		int k = 0;
+		while (k < n && found[k].id != id)
+			k++;
+		if (k < n)
+		{
+			found[k].liveCount++;
+			continue;
+		}
+		found[n].id = id;
+		found[n].liveCount = 1;
+		found[n].listIndex = li;
+		memcpy(found[n].templ, templ, EMLIST_SIZE);
+		n++;
+	}
+
+	// Orden por id, para que F9 recorra siempre en el mismo orden.
+	for (int a = 1; a < n; a++)
+	{
+		Candidate tmp = found[a];
+		int b = a - 1;
+		while (b >= 0 && found[b].id > tmp.id)
+		{
+			found[b + 1] = found[b];
+			b--;
+		}
+		found[b + 1] = tmp;
+	}
+
+	uint32_t sig = 0;
+	for (int i = 0; i < n; i++)
+		sig = sig * 131u + (uint32_t)found[i].id + 1u;
+
+	for (int i = 0; i < n; i++)
+		g_cands[i] = found[i];
+	g_candCount = n;
+
+	// Mantener el modelo preferido si sigue disponible; si no, el primero.
+	g_candIndex = 0;
+	for (int i = 0; i < n; i++)
+		if (g_cands[i].id == g_wantedId)
+			g_candIndex = i;
+
+	if (sig != g_candSig)
+	{
+		g_candSig = sig;
+		char text[400];
+		text[0] = '\0';
+		size_t used = 0;
+		for (int i = 0; i < n && used + 48 < sizeof(text); i++)
+		{
+			int w = snprintf(text + used, sizeof(text) - used, "%s0x%02X %s x%d",
+				i ? ", " : "", g_cands[i].id, ModelName(g_cands[i].id), g_cands[i].liveCount);
+			if (w < 0)
+				break;
+			used += (size_t)w;
+		}
+		if (n == 0)
+			Log("Modelos disponibles ahora: ninguno (no hay enemigos compatibles vivos en esta sala)");
+		else
+			Log("Modelos disponibles ahora: %s", text);
+	}
+}
 
 static bool SafeSpawn(void* list, uintptr_t* outEm)
 {
@@ -788,24 +904,49 @@ static void PutShort(uint8_t* base, int offset, int value)
 
 static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 {
-	uint8_t id = g_modelIds[g_modelIndex];
-	Log("Creando fantasma: modelo 0x%02X (%s) en sala 0x%04X ...", id, g_modelNames[g_modelIndex], room);
+	// Elegimos el modelo entre los que ya estan cargados en la sala (se vuelve a mirar justo ahora).
+	ScanCandidates();
+	if (g_candCount == 0)
+	{
+		g_holdUntil = GetTickCount() + 500;
+		return; // no es un fallo: todavia no hay un enemigo del que copiar el modelo
+	}
+	if (g_candIndex >= g_candCount)
+		g_candIndex = 0;
+	const Candidate& c = g_cands[g_candIndex];
+	uint8_t id = c.id;
+	Log("Creando fantasma: modelo 0x%02X (%s), copiado de la entrada %d de la lista de la sala (hay %d vivos asi), sala 0x%04X ...",
+		id, ModelName(id), c.listIndex, c.liveCount, room);
 
-	// Armamos la estructura EM_LIST.
-	memset(g_emList, 0, sizeof(g_emList));
-	g_emList[0] = 0x01;          // be_flag_0: vivo
-	g_emList[1] = id;            // id_1: que personaje
+	// Armamos la estructura EM_LIST copiando la entrada real de un enemigo de ese modelo
+	// y cambiando solo lo necesario.
+	memcpy(g_emList, c.templ, sizeof(g_emList));
+	g_emList[0] = 0x01;            // be_flag_0: vivo, sin otras marcas
+	g_emList[0x0A] = 0xFF;         // emset_no_A: no pertenece a la lista de la sala
 	int16_t hp = 1000;
 	memcpy(g_emList + 0x08, &hp, 2);
-	// Posicion: el juego guarda las posiciones del archivo ESL en shorts (aprox. mundo / 10).
-	// Es solo la posicion inicial: despues la fijamos nosotros cada frame.
+	memset(g_emList + 0x1C, 0, 4); // campos de extension de re4_tweaks: sin escala ni velocidad especial
+	// Posicion inicial: el juego guarda las posiciones del archivo ESL en shorts (aprox. mundo / 10).
+	// Es solo el punto de partida: despues la fijamos nosotros cada frame.
+	// (room_18 se deja como esta: viene de un enemigo vivo de esta misma sala.)
 	PutShort(g_emList, 0x0C, (int)(snap.pos[0] / 10.0f));
 	PutShort(g_emList, 0x0E, (int)(snap.pos[1] / 10.0f));
 	PutShort(g_emList, 0x10, (int)(snap.pos[2] / 10.0f));
-	memcpy(g_emList + 0x18, &room, 2); // room_18
+
+	// Queda anotado exactamente lo que se le pasa al juego: si se cuelga, sirve para ver por que.
+	char hex[EMLIST_SIZE * 3 + 1];
+	hex[0] = '\0';
+	for (int i = 0; i < EMLIST_SIZE; i++)
+		snprintf(hex + i * 3, 4, "%02X ", g_emList[i]);
+	Log("EM_LIST que se envia al juego: %s", hex);
 
 	uintptr_t em = 0;
-	if (!SafeSpawn(g_emList, &em))
+	g_riskId = id;
+	g_riskCode = 1;
+	g_riskStart = GetTickCount();
+	bool spawnOk = SafeSpawn(g_emList, &em);
+	g_riskStart = 0;
+	if (!spawnOk)
 	{
 		Log("ERROR: el juego dio una excepcion al crear el modelo 0x%02X", id);
 		g_spawnFails++;
@@ -822,7 +963,7 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	uint8_t realId = 0;
 	if (em == 0 || !SafeRead(em + EM_GUID, &guid, 4) || !SafeRead(em + EM_ID, &realId, 1))
 	{
-		Log("ERROR: el resultado no es un personaje valido (el modelo 0x%02X seguramente no esta cargado en esta sala)", id);
+		Log("ERROR: el juego no devolvio un personaje valido para el modelo 0x%02X", id);
 		memset(&g_ghost, 0, sizeof(g_ghost));
 		g_spawnFails++;
 		g_holdUntil = GetTickCount() + 2000;
@@ -912,10 +1053,18 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 	SafeWrite(g_ghost.em + EM_POS, g_ghost.pos, sizeof(g_ghost.pos));
 	SafeWrite(g_ghost.em + EM_ANG_Y, &g_ghost.yaw, sizeof(g_ghost.yaw));
 
-	if (g_updateMatrix && !SafeMatUpdate(g_ghost.em))
+	if (g_updateMatrix)
 	{
-		g_updateMatrix = false;
-		Log("AVISO: fallo la actualizacion de la matriz del fantasma; se desactiva (actualizar_matriz=0)");
+		g_riskId = g_ghost.id;
+		g_riskCode = 2;
+		g_riskStart = GetTickCount();
+		bool matOk = SafeMatUpdate(g_ghost.em);
+		g_riskStart = 0;
+		if (!matOk)
+		{
+			g_updateMatrix = false;
+			Log("AVISO: fallo la actualizacion de la matriz del fantasma; se desactiva (actualizar_matriz=0)");
+		}
 	}
 }
 
@@ -949,6 +1098,13 @@ static void HandleHotkeys()
 		g_ghostEnabled = !g_ghostEnabled;
 		g_spawnFails = 0;
 		Log("F8: fantasma %s", g_ghostEnabled ? "ACTIVADO" : "DESACTIVADO");
+		if (g_ghostEnabled)
+		{
+			ScanCandidates();
+			if (g_candCount == 0)
+				Log("AVISO: ahora no hay ningun enemigo compatible vivo en esta sala, asi que no hay modelo para copiar. "
+					"El fantasma aparecera solo cuando haya uno (por ejemplo, cerca de los primeros Ganados).");
+		}
 		MessageBeep(g_ghostEnabled ? MB_ICONASTERISK : MB_ICONHAND);
 		if (!g_ghostEnabled)
 			GhostDespawn();
@@ -956,11 +1112,22 @@ static void HandleHotkeys()
 
 	if (f9 && !g_f9Prev)
 	{
-		g_modelIndex = (g_modelIndex + 1) % g_modelCount;
-		g_spawnFails = 0;
-		Log("F9: modelo del fantasma = 0x%02X (%s)", g_modelIds[g_modelIndex], g_modelNames[g_modelIndex]);
-		MessageBeep(MB_OK);
-		GhostDespawn();
+		ScanCandidates();
+		if (g_candCount == 0)
+		{
+			Log("F9: no hay modelos disponibles en esta sala (no hay enemigos compatibles vivos)");
+			MessageBeep(MB_ICONHAND);
+		}
+		else
+		{
+			g_candIndex = (g_candIndex + 1) % g_candCount;
+			g_wantedId = g_cands[g_candIndex].id;
+			g_spawnFails = 0;
+			Log("F9: modelo del fantasma = 0x%02X (%s), %d de %d disponibles",
+				g_wantedId, ModelName(g_wantedId), g_candIndex + 1, g_candCount);
+			MessageBeep(MB_OK);
+			GhostDespawn();
+		}
 	}
 
 	g_f8Prev = f8;
@@ -987,6 +1154,15 @@ static void GhostUpdate(float dt)
 		GhostDespawn();
 	}
 	g_lastRoom = room;
+
+	// Cada medio segundo, mientras el juego esta en su bucle principal, se actualiza la lista de modelos disponibles
+	// (asi el log siempre dice que hay en la sala, aunque el fantasma este apagado).
+	static DWORD s_nextScan = 0;
+	if (rno0 == RNO0_MAINLOOP && (int)(now - s_nextScan) >= 0)
+	{
+		s_nextScan = now + 500;
+		ScanCandidates();
+	}
 
 	// ?Hay que mostrar al fantasma ahora mismo?
 	RemoteSnap snap = GetRemoteSnap();
@@ -1023,6 +1199,13 @@ static void GhostUpdate(float dt)
 			return;
 		}
 		GhostSpawn(snap, room);
+		if (!g_ghost.em && g_candCount == 0 && !g_warnedNoCand)
+		{
+			g_warnedNoCand = true;
+			Log("Esperando: no hay enemigos compatibles vivos en esta sala para copiar su modelo.");
+		}
+		if (g_candCount > 0)
+			g_warnedNoCand = false;
 		return;
 	}
 
@@ -1180,7 +1363,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3 iniciado");
+	Log("RE4 Coop - hito 3b (v2b) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
@@ -1229,13 +1412,16 @@ void ModMain()
 	if (!netOk)
 		Log("AVISO: sin conexion. Revisa re4coop.ini y los mensajes de arriba.");
 
-	// Fantasma: lista de modelos y enganche de la ventana.
-	int cfgModel = cfgOk ? cfg.modelId : 0x10;
-	BuildModelList(cfgModel);
+	// Fantasma: modelo preferido y enganche de la ventana.
+	g_wantedId = (uint8_t)(cfgOk ? cfg.modelId : 0x10);
 	g_updateMatrix = cfgOk ? cfg.updateMatrix : true;
+	g_killOnHang = cfgOk ? cfg.killOnHang : true;
 	g_ghostEnabled = cfgOk && cfg.ghostOnStart && ghostPossible;
-	Log("Modelo inicial del fantasma: 0x%02X (%s). Teclas: F8 = activar/desactivar, F9 = cambiar modelo.",
-		g_modelIds[g_modelIndex], g_modelNames[g_modelIndex]);
+	Log("Modelo preferido del fantasma: 0x%02X (%s). Solo se crea si ya hay un enemigo igual vivo en la sala. "
+		"Teclas: F8 = activar/desactivar, F9 = cambiar entre los modelos disponibles.",
+		g_wantedId, ModelName(g_wantedId));
+	Log("Tecla de emergencia: mantener Ctrl + Shift + F12 durante 2 segundos cierra el juego. "
+		"Cierre automatico si se cuelga al crear el fantasma: %s.", g_killOnHang ? "ACTIVADO" : "desactivado");
 
 	bool hooked = false;
 	if (ghostPossible)
@@ -1254,11 +1440,58 @@ void ModMain()
 	DWORD lastLog = GetTickCount();
 	DWORD lastTickPost = 0;
 	uint32_t lastFrame = 0;
+	bool hangReported = false;
+	DWORD panicStart = 0;
 
 	for (;;)
 	{
 		Sleep(2);
 		DWORD now = GetTickCount();
+
+		// Vigilancia: si el juego lleva mucho tiempo dentro de una llamada arriesgada, esta colgado. Este hilo
+		// sigue funcionando aunque el juego no, asi que puede anotarlo en el log y cerrar el juego solo
+		// (en pantalla completa un juego colgado puede dejar la pantalla congelada, sin acceso al Administrador de tareas).
+		DWORD riskStart = g_riskStart;
+		if (riskStart != 0)
+		{
+			// La hora se lee DESPUES de leer riskStart. Con la hora leida antes (now), si el juego empezaba la llamada
+			// justo en el medio, la resta daba un numero enorme y se habria cerrado el juego sin estar colgado.
+			DWORD waited = GetTickCount() - riskStart;
+			int code = g_riskCode;
+			int rid = g_riskId;
+			if (waited > 4000 && !hangReported)
+			{
+				hangReported = true;
+				Log("COLGADO: el juego no volvio de %s (modelo 0x%02X) en mas de 4 segundos.%s",
+					code == 1 ? "EmSetEvent (crear el personaje)" : "matUpdate (actualizar la matriz del personaje)",
+					(unsigned)rid,
+					g_killOnHang ? " Se cierra solo en unos segundos." : " Hay que cerrarlo desde el Administrador de tareas.");
+			}
+			// Solo se cierra si SIGUE dentro de la misma llamada que empezo hace mas de 7 segundos.
+			if (waited > 7000 && g_killOnHang && g_riskStart == riskStart)
+			{
+				Log("Cerrando el juego automaticamente (cerrar_si_se_cuelga=1). Mandame este log.");
+				TerminateProcess(GetCurrentProcess(), 1);
+			}
+		}
+
+		// Tecla de emergencia: mantener Ctrl + Shift + F12 durante 2 segundos cierra el juego al instante.
+		// Sirve aunque el juego este colgado (este hilo sigue funcionando) y aunque la ventana no tenga el foco.
+		bool panicKeys = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
+			(GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+		if (panicKeys)
+		{
+			DWORD t = GetTickCount();
+			if (panicStart == 0)
+				panicStart = t;
+			else if (t - panicStart >= 2000)
+			{
+				Log("TECLA DE EMERGENCIA: se cierra el juego (Ctrl+Shift+F12 mantenido 2 segundos).");
+				TerminateProcess(GetCurrentProcess(), 1);
+			}
+		}
+		else
+			panicStart = 0;
 
 		// Le pedimos al juego que ejecute un tick (en su hilo). Solo uno a la vez: si el juego
 		// todavia no proceso el anterior, no acumulamos mensajes.
@@ -1345,10 +1578,10 @@ void ModMain()
 			ReadGameState(&rno0, &room, &frame);
 			if (lastFrame == 0)
 				lastFrame = frame;
-			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X rno0=%u",
+			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X disponibles=%d rno0=%u",
 				g_tickCount, (unsigned)(frame - lastFrame),
 				g_ghostEnabled ? "ON" : "off", g_ghost.em ? " (creado)" : "",
-				g_modelIds[g_modelIndex], (unsigned)rno0);
+				(unsigned)g_wantedId, g_candCount, (unsigned)rno0);
 			lastFrame = frame;
 			g_tickCount = 0;
 		}

@@ -1092,20 +1092,16 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		{
 			if (!g_ghost.pinSet)
 			{
-				// Ganado (0x12): la rutina que frena el ataque, segun las pruebas, es r1=18 r2=1 (la que usa cuando Leon
-				// se le acerca). Se fija en cuanto el Ganado entra en ella. Para otros modelos, se guarda la que tenga
-				// unos 7 segundos despues de crearlo.
+				// Se guarda la rutina que tiene al terminar de inicializarse (el estado inicial, tranquilo) y se
+				// mantiene fija: asi la IA nunca llega a la rutina en la que ataca (en las pruebas, r1=41 cerca de Leon).
 				uint8_t cr[3] = { 0, 0, 0 };
-				if (g_ghost.frames > 60 &&
+				if (g_ghost.frames >= 3 &&
 					SafeRead(g_ghost.em + 0xFD, &cr[0], 1) && SafeRead(g_ghost.em + 0xFE, &cr[1], 1) && SafeRead(g_ghost.em + 0xFF, &cr[2], 1))
 				{
-					bool capture = (g_ghost.id == 0x12) ? (cr[0] == 18 && cr[1] == 1) : (g_ghost.frames > 400);
-					if (capture)
-					{
-						memcpy(g_ghost.pinR, cr, 3);
-						g_ghost.pinSet = true;
-						Log("Modo %d: se fija la rutina del fantasma en r1=%u r2=%u r3=%u", g_freezeMode, (unsigned)cr[0], (unsigned)cr[1], (unsigned)cr[2]);
-					}
+					memcpy(g_ghost.pinR, cr, 3);
+					g_ghost.pinSet = true;
+					Log("Modo %d: se fija la rutina del fantasma en r1=%u r2=%u r3=%u (tras %d frames)", g_freezeMode,
+						(unsigned)cr[0], (unsigned)cr[1], (unsigned)cr[2], g_ghost.frames);
 				}
 			}
 			else
@@ -1222,7 +1218,9 @@ static void HandleHotkeys()
 	if (f10 && !g_f10Prev)
 	{
 		g_freezeMode = g_freezeMode % 4 + 1;
-		g_ghost.pinSet = false;
+		// El fantasma se vuelve a crear con el modo nuevo (cambiar las banderas de uno ya creado puede colgar el juego).
+		g_spawnFails = 0;
+		GhostDespawn();
 		Log("F10: modo de inmovilizacion del fantasma = %d (%s)", g_freezeMode,
 			g_freezeMode == 1 ? "solo sin movimiento" : g_freezeMode == 2 ? "sin movimiento y sin animacion" :
 			g_freezeMode == 3 ? "sin movimiento, sin animacion y rutina fija" : "sin movimiento y rutina fija, con animacion");
@@ -1462,7 +1460,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3g (v3e) iniciado");
+	Log("RE4 Coop - hito 3h (v3f) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,

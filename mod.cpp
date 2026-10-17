@@ -689,6 +689,7 @@ struct Ghost
 	uint8_t id;
 	int frames;        // frames desde que se creo
 	bool frozen;       // ya se le quito el movimiento propio
+	bool isClone;      // es un clon de Leon (prueba de skin): se congela a los 2 frames, sin esperar a r_no_0
 	bool pinSet;       // modo 3: ya se guardo la rutina a mantener
 	uint8_t pinR[3];   // modo 3: r_no_1, r_no_2, r_no_3 a mantener
 	int reFrozen;      // veces que el juego le volvio a activar el movimiento y se lo quitamos de nuevo
@@ -890,6 +891,25 @@ static bool SafeMatUpdate(uintptr_t em)
 // ?El puntero del fantasma sigue siendo un personaje vivo del juego?
 // (el juego destruye a todos los personajes al cambiar de sala)
 // Resumen de estado interno de un personaje (para el log): rutinas, animacion, vida y flags de estado.
+// Vuelca n bytes de memoria como texto hexadecimal (para buscar en el log que campo cambia con la animacion).
+static void HexDump(uintptr_t addr, int n, char* buf, size_t bufSize)
+{
+	buf[0] = '\0';
+	size_t used = 0;
+	for (int i = 0; i < n && used + 4 < bufSize; i++)
+	{
+		uint8_t b = 0;
+		if (!SafeRead(addr + (uintptr_t)i, &b, 1))
+		{
+			snprintf(buf + used, bufSize - used, "?? ");
+			used += 3;
+			continue;
+		}
+		snprintf(buf + used, bufSize - used, "%02X ", (unsigned)b);
+		used += 3;
+	}
+}
+
 static void DescribeEm(uintptr_t em, char* buf, size_t bufSize)
 {
 	uint8_t r1 = 0, r2 = 0, r3 = 0;
@@ -1070,6 +1090,7 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	memset(&g_ghost, 0, sizeof(g_ghost));
 	g_ghost.em = em;
 	g_ghost.id = id;
+	g_ghost.isClone = (g_forceId >= 0);
 	uint32_t guid = 0;
 	uint8_t realId = 0;
 	if (em == 0 || !SafeRead(em + EM_GUID, &guid, 4) || !SafeRead(em + EM_ID, &realId, 1))
@@ -1128,7 +1149,7 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		uint32_t flags = 0;
 		if (SafeRead(g_ghost.em + EM_RNO0, &rno0, 1) && SafeRead(g_ghost.em + EM_FLAGS, &flags, 4))
 		{
-			if (rno0 != 0)
+			if (rno0 != 0 || (g_ghost.isClone && g_ghost.frames >= 2))
 			{
 				flags &= ~FLAG_MOVE;
 				SafeWrite(g_ghost.em + EM_FLAGS, &flags, 4);
@@ -1567,7 +1588,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3j (v3h) iniciado");
+	Log("RE4 Coop - hito 3k (v3i) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
@@ -1754,6 +1775,11 @@ void ModMain()
 			char det[240];
 			DescribeEm(leon.obj, det, sizeof(det));
 			Log("  Leon detalle: %s", det);
+			{
+				char dump[0x90 * 3 + 8];
+				HexDump(leon.obj + 0x1D8, 0x90, dump, sizeof(dump));
+				Log("  Leon movimiento[1D8..268]: %s", dump);
+			}
 			if (g_ghost.em)
 			{
 				uint32_t gFlags = 0;
@@ -1765,6 +1791,11 @@ void ModMain()
 					(unsigned)gFlags, (unsigned)gR0, sqrtf(ddx * ddx + ddz * ddz), g_ghost.reFrozen, g_freezeMode);
 				DescribeEm(g_ghost.em, det, sizeof(det));
 				Log("  Fantasma detalle: %s", det);
+				{
+					char dump[0x90 * 3 + 8];
+					HexDump(g_ghost.em + 0x1D8, 0x90, dump, sizeof(dump));
+					Log("  Fantasma movimiento[1D8..268]: %s", dump);
+				}
 			}
 		}
 		else if (lastLeonValid)

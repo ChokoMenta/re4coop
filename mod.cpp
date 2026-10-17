@@ -301,6 +301,15 @@ static bool ReadGameState(uint8_t* rno0, uint16_t* room, uint32_t* frame)
 	return SafeRead(g + G_RNO0, rno0, 1) && SafeRead(g + G_ROOM, room, 2) && SafeRead(g + G_FRAME, frame, 4);
 }
 
+// Vida de Leon (esta en los datos globales, no en el personaje).
+static bool ReadPlayerHp(int16_t* cur, int16_t* mx)
+{
+	uintptr_t g = 0;
+	if (!g_pGvar || !SafeRead(g_pGvar, &g, 4) || g < 0x10000)
+		return false;
+	return SafeRead(g + 0x4FB4, cur, 2) && SafeRead(g + 0x4FB6, mx, 2);   // playerHpCur_4FB4 / playerHpMax_4FB6
+}
+
 // ---------------------------------------------------------------- configuracion (re4coop.ini)
 
 struct Config
@@ -670,6 +679,7 @@ static const uintptr_t EM_RNO0 = 0xFC;      // cModel::r_no_0_FC (0 = Init)
 static const uintptr_t EM_ID = 0x100;       // cModel::id_100
 static const uint32_t FLAG_VALID_MASK = 0x601; // cEm::IsValid
 static const uint32_t FLAG_MOVE = 0x20;
+static const uint32_t FLAG_DISABLEMOTION = 0x4000; // UNIT_BE_FLAG_DISABLEMOTION
 static const uint32_t FLAG_DESTRUCT = 0x400;
 
 struct Ghost
@@ -679,6 +689,8 @@ struct Ghost
 	uint8_t id;
 	int frames;        // frames desde que se creo
 	bool frozen;       // ya se le quito el movimiento propio
+	bool pinSet;       // modo 3: ya se guardo la rutina a mantener
+	uint8_t pinR[3];   // modo 3: r_no_1, r_no_2, r_no_3 a mantener
 	int reFrozen;      // veces que el juego le volvio a activar el movimiento y se lo quitamos de nuevo
 	bool havePos;
 	float pos[3];
@@ -723,6 +735,7 @@ static volatile DWORD g_riskStart = 0;
 static volatile int g_riskCode = 0;   // 1 = EmSetEvent (crear el personaje), 2 = matUpdate (actualizar su matriz)
 static volatile int g_riskId = 0;     // modelo involucrado
 static bool g_killOnHang = true;
+static int g_freezeMode = 2;   // 1 = solo sin movimiento, 2 = ademas sin animacion, 3 = ademas rutina fija (F10 cambia)
 
 // Recorre la lista de personajes del juego y arma la lista de modelos disponibles (solo en el hilo del juego).
 static void ScanCandidates()
@@ -1055,18 +1068,45 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 			}
 		}
 	}
-	else
+	else if (g_ghost.reFrozen >= 0)
 	{
-		// El juego despierta a los enemigos cuando el jugador se acerca (y vuelve a activar su movimiento/IA,
-		// con lo que pueden atacar). Por eso se lo volvemos a quitar en cada frame.
+		// Modo 1: sin movimiento propio. Modo 2: ademas sin animacion (para que no pueda ejecutar ataques).
+		// Modo 3: ademas se mantiene fija su rutina interna (r_no_1/2/3) en la que tenia tranquilo.
 		uint32_t flags = 0;
-		if (SafeRead(g_ghost.em + EM_FLAGS, &flags, 4) && (flags & FLAG_MOVE) != 0 && g_ghost.reFrozen >= 0)
+		if (SafeRead(g_ghost.em + EM_FLAGS, &flags, 4))
 		{
-			flags &= ~FLAG_MOVE;
-			SafeWrite(g_ghost.em + EM_FLAGS, &flags, 4);
-			g_ghost.reFrozen++;
-			if (g_ghost.reFrozen <= 5)
-				Log("El juego le volvio a activar el movimiento al fantasma (vez %d); se lo quito de nuevo", g_ghost.reFrozen);
+			uint32_t want = flags & ~FLAG_MOVE;
+			if (g_freezeMode >= 2) want |= FLAG_DISABLEMOTION; else want &= ~FLAG_DISABLEMOTION;
+			if (want != flags)
+			{
+				SafeWrite(g_ghost.em + EM_FLAGS, &want, 4);
+				if ((flags & FLAG_MOVE) != 0)
+				{
+					g_ghost.reFrozen++;
+					if (g_ghost.reFrozen <= 5)
+						Log("El juego le volvio a activar el movimiento al fantasma (vez %d); se lo quito de nuevo", g_ghost.reFrozen);
+				}
+			}
+		}
+		if (g_freezeMode >= 3)
+		{
+			if (!g_ghost.pinSet)
+			{
+				// Se guarda la rutina unos 7 segundos despues de crearlo (ya esta en su estado tranquilo).
+				if (g_ghost.frames > 400 &&
+					SafeRead(g_ghost.em + 0xFD, &g_ghost.pinR[0], 1) && SafeRead(g_ghost.em + 0xFE, &g_ghost.pinR[1], 1) &&
+					SafeRead(g_ghost.em + 0xFF, &g_ghost.pinR[2], 1))
+				{
+					g_ghost.pinSet = true;
+					Log("Modo 3: se fija la rutina del fantasma en r1=%u r2=%u r3=%u", (unsigned)g_ghost.pinR[0], (unsigned)g_ghost.pinR[1], (unsigned)g_ghost.pinR[2]);
+				}
+			}
+			else
+			{
+				SafeWrite(g_ghost.em + 0xFD, &g_ghost.pinR[0], 1);
+				SafeWrite(g_ghost.em + 0xFE, &g_ghost.pinR[1], 1);
+				SafeWrite(g_ghost.em + 0xFF, &g_ghost.pinR[2], 1);
+			}
 		}
 	}
 
@@ -1124,6 +1164,7 @@ static int g_tickFaults = 0;
 
 static bool g_f8Prev = false;
 static bool g_f9Prev = false;
+static bool g_f10Prev = false;
 
 static void HandleHotkeys()
 {
@@ -1131,6 +1172,7 @@ static void HandleHotkeys()
 	bool focused = (GetForegroundWindow() == g_hwnd);
 	bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
 	bool f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+	bool f10 = focused && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
 
 	if (f8 && !g_f8Prev)
 	{
@@ -1170,7 +1212,17 @@ static void HandleHotkeys()
 	}
 
 	g_f8Prev = f8;
+	if (f10 && !g_f10Prev)
+	{
+		g_freezeMode = g_freezeMode % 3 + 1;
+		g_ghost.pinSet = false;
+		Log("F10: modo de inmovilizacion del fantasma = %d (%s)", g_freezeMode,
+			g_freezeMode == 1 ? "solo sin movimiento" : g_freezeMode == 2 ? "sin movimiento y sin animacion" : "sin movimiento, sin animacion y rutina fija");
+		MessageBeep(MB_OK);
+	}
+
 	g_f9Prev = f9;
+	g_f10Prev = f10;
 }
 
 static void GhostUpdate(float dt)
@@ -1402,7 +1454,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3d (v3b) iniciado");
+	Log("RE4 Coop - hito 3e (v3c) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
@@ -1581,9 +1633,11 @@ void ModMain()
 			SafeRead(leon.obj + 0x04, &lFlags, 4);
 			SafeRead(leon.obj + 0x324, &lHp, 2);
 			SafeRead(leon.obj + EM_RNO0, &lR0, 1);
-			Log("Leon    @0x%08X pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X flags=0x%08X hp=%d r0=%u",
+			int16_t vidaCur = 0, vidaMax = 0;
+			ReadPlayerHp(&vidaCur, &vidaMax);
+			Log("Leon    @0x%08X pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X flags=0x%08X vida=%d/%d r0=%u",
 				(unsigned)leon.obj, leon.pos[0], leon.pos[1], leon.pos[2], leon.angY, (unsigned)ReadRoomNow(),
-				(unsigned)lFlags, (int)lHp, (unsigned)lR0);
+				(unsigned)lFlags, (int)vidaCur, (int)vidaMax, (unsigned)lR0);
 			char det[240];
 			DescribeEm(leon.obj, det, sizeof(det));
 			Log("  Leon detalle: %s", det);
@@ -1594,8 +1648,8 @@ void ModMain()
 				SafeRead(g_ghost.em + EM_FLAGS, &gFlags, 4);
 				SafeRead(g_ghost.em + EM_RNO0, &gR0, 1);
 				float ddx = g_ghost.pos[0] - leon.pos[0], ddz = g_ghost.pos[2] - leon.pos[2];
-				Log("Fantasma flags=0x%08X r0=%u distancia_a_Leon=%.0f reactivaciones=%d",
-					(unsigned)gFlags, (unsigned)gR0, sqrtf(ddx * ddx + ddz * ddz), g_ghost.reFrozen);
+				Log("Fantasma flags=0x%08X r0=%u distancia_a_Leon=%.0f reactivaciones=%d modo=%d",
+					(unsigned)gFlags, (unsigned)gR0, sqrtf(ddx * ddx + ddz * ddz), g_ghost.reFrozen, g_freezeMode);
 				DescribeEm(g_ghost.em, det, sizeof(det));
 				Log("  Fantasma detalle: %s", det);
 			}

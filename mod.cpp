@@ -721,6 +721,24 @@ struct Candidate
 	uint8_t templ[EMLIST_SIZE];    // copia de esa entrada
 };
 static const int kCandMax = 16;
+
+// ---- prueba de skin (hito 3i) ----
+// F11 prueba crear el fantasma con el modelo de Leon (o de Ashley): se lee el numero de modelo (id) de sus
+// personajes reales en memoria y se lo pone en la estructura EM_LIST que se copia de un enemigo vivo.
+static int g_skinMode = 0;    // 0 = normal (copia del enemigo), 1 = id de Leon, 2 = id de Ashley
+static int g_forceId = -1;    // -1 = no forzar
+
+static bool ReadActorId(uintptr_t globalVar, int* id)
+{
+	uintptr_t actor = 0;
+	uint8_t v = 0;
+	if (!globalVar || !SafeRead(globalVar, &actor, 4) || actor < 0x10000)
+		return false;
+	if (!SafeRead(actor + EM_ID, &v, 1))
+		return false;
+	*id = v;
+	return true;
+}
 static Candidate g_cands[kCandMax];
 static int g_candCount = 0;
 static int g_candIndex = 0;        // el elegido con F9
@@ -958,6 +976,12 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	// Armamos la estructura EM_LIST copiando la entrada real de un enemigo de ese modelo
 	// y cambiando solo lo necesario.
 	memcpy(g_emList, c.templ, sizeof(g_emList));
+	if (g_forceId >= 0)
+	{
+		g_emList[1] = (uint8_t)g_forceId;
+		id = (uint8_t)g_forceId;
+		Log("PRUEBA DE SKIN: se pide el modelo 0x%02X (en vez del 0x%02X del enemigo copiado)", id, c.id);
+	}
 	g_emList[0] = 0x01;            // be_flag_0: vivo, sin otras marcas
 	g_emList[0x0A] = 0xFF;         // emset_no_A: no pertenece a la lista de la sala
 	int16_t hp = 1000;
@@ -986,6 +1010,7 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	if (!spawnOk)
 	{
 		Log("ERROR: el juego dio una excepcion al crear el modelo 0x%02X", id);
+		if (g_forceId >= 0) { Log("Se vuelve al modelo normal."); g_forceId = -1; g_skinMode = 0; }
 		g_spawnFails++;
 		g_holdUntil = GetTickCount() + 2000;
 		return;
@@ -1001,6 +1026,7 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	if (em == 0 || !SafeRead(em + EM_GUID, &guid, 4) || !SafeRead(em + EM_ID, &realId, 1))
 	{
 		Log("ERROR: el juego no devolvio un personaje valido para el modelo 0x%02X", id);
+		if (g_forceId >= 0) { Log("Se vuelve al modelo normal."); g_forceId = -1; g_skinMode = 0; }
 		memset(&g_ghost, 0, sizeof(g_ghost));
 		g_spawnFails++;
 		g_holdUntil = GetTickCount() + 2000;
@@ -1168,6 +1194,7 @@ static int g_tickFaults = 0;
 static bool g_f8Prev = false;
 static bool g_f9Prev = false;
 static bool g_f10Prev = false;
+static bool g_f11Prev = false;
 
 static void HandleHotkeys()
 {
@@ -1176,6 +1203,25 @@ static void HandleHotkeys()
 	bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
 	bool f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 	bool f10 = focused && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+	bool f11 = focused && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+
+	if (f11 && !g_f11Prev)
+	{
+		int leonId = -1, ashId = -1;
+		bool haveLeon = ReadActorId(g_plGlobal, &leonId);
+		bool haveAsh = ReadActorId(g_asGlobal, &ashId);
+		Log("F11: ids reales en memoria: Leon=%s0x%02X Ashley=%s0x%02X", haveLeon ? "" : "(no leido) ", haveLeon ? leonId : 0,
+			haveAsh ? "" : "(no leido) ", haveAsh ? ashId : 0);
+		g_skinMode = (g_skinMode + 1) % 3;
+		if (g_skinMode == 1 && haveLeon) g_forceId = leonId;
+		else if (g_skinMode == 2 && haveAsh) g_forceId = ashId;
+		else { g_forceId = -1; if (g_skinMode != 0) g_skinMode = 0; }
+		g_spawnFails = 0;
+		Log("F11: skin de prueba = %s", g_skinMode == 0 ? "normal (copia del enemigo)" : g_skinMode == 1 ? "modelo de Leon" : "modelo de Ashley");
+		GhostDespawn();
+		MessageBeep(MB_OK);
+	}
+	g_f11Prev = f11;
 
 	if (f8 && !g_f8Prev)
 	{
@@ -1460,7 +1506,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3h (v3f) iniciado");
+	Log("RE4 Coop - hito 3i (v3g) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,

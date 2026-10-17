@@ -679,6 +679,7 @@ struct Ghost
 	uint8_t id;
 	int frames;        // frames desde que se creo
 	bool frozen;       // ya se le quito el movimiento propio
+	int reFrozen;      // veces que el juego le volvio a activar el movimiento y se lo quitamos de nuevo
 	bool havePos;
 	float pos[3];
 	float yaw;
@@ -1026,8 +1027,23 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 			else if (g_ghost.frames > 60)
 			{
 				g_ghost.frozen = true;
+				g_ghost.reFrozen = -1; // no se le quita el movimiento
 				Log("AVISO: el fantasma no termino de inicializarse en 60 frames; se deja con su movimiento propio");
 			}
+		}
+	}
+	else
+	{
+		// El juego despierta a los enemigos cuando el jugador se acerca (y vuelve a activar su movimiento/IA,
+		// con lo que pueden atacar). Por eso se lo volvemos a quitar en cada frame.
+		uint32_t flags = 0;
+		if (SafeRead(g_ghost.em + EM_FLAGS, &flags, 4) && (flags & FLAG_MOVE) != 0 && g_ghost.reFrozen >= 0)
+		{
+			flags &= ~FLAG_MOVE;
+			SafeWrite(g_ghost.em + EM_FLAGS, &flags, 4);
+			g_ghost.reFrozen++;
+			if (g_ghost.reFrozen <= 5)
+				Log("El juego le volvio a activar el movimiento al fantasma (vez %d); se lo quito de nuevo", g_ghost.reFrozen);
 		}
 	}
 
@@ -1363,7 +1379,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3b (v2b) iniciado");
+	Log("RE4 Coop - hito 3c (v3) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
@@ -1536,8 +1552,25 @@ void ModMain()
 		leonOk = ReadPlayer(g_plGlobal, &leon);
 		if (leonOk)
 		{
-			Log("Leon    @0x%08X pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X",
-				(unsigned)leon.obj, leon.pos[0], leon.pos[1], leon.pos[2], leon.angY, (unsigned)ReadRoomNow());
+			uint32_t lFlags = 0;
+			int16_t lHp = 0;
+			uint8_t lR0 = 0;
+			SafeRead(leon.obj + 0x04, &lFlags, 4);
+			SafeRead(leon.obj + 0x324, &lHp, 2);
+			SafeRead(leon.obj + EM_RNO0, &lR0, 1);
+			Log("Leon    @0x%08X pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X flags=0x%08X hp=%d r0=%u",
+				(unsigned)leon.obj, leon.pos[0], leon.pos[1], leon.pos[2], leon.angY, (unsigned)ReadRoomNow(),
+				(unsigned)lFlags, (int)lHp, (unsigned)lR0);
+			if (g_ghost.em)
+			{
+				uint32_t gFlags = 0;
+				uint8_t gR0 = 0;
+				SafeRead(g_ghost.em + EM_FLAGS, &gFlags, 4);
+				SafeRead(g_ghost.em + EM_RNO0, &gR0, 1);
+				float ddx = g_ghost.pos[0] - leon.pos[0], ddz = g_ghost.pos[2] - leon.pos[2];
+				Log("Fantasma flags=0x%08X r0=%u distancia_a_Leon=%.0f reactivaciones=%d",
+					(unsigned)gFlags, (unsigned)gR0, sqrtf(ddx * ddx + ddz * ddz), g_ghost.reFrozen);
+			}
 		}
 		else if (lastLeonValid)
 		{

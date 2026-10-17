@@ -735,7 +735,7 @@ static volatile DWORD g_riskStart = 0;
 static volatile int g_riskCode = 0;   // 1 = EmSetEvent (crear el personaje), 2 = matUpdate (actualizar su matriz)
 static volatile int g_riskId = 0;     // modelo involucrado
 static bool g_killOnHang = true;
-static int g_freezeMode = 2;   // 1 = solo sin movimiento, 2 = ademas sin animacion, 3 = ademas rutina fija (F10 cambia)
+static int g_freezeMode = 3;   // 1 = sin movimiento, 2 = + sin animacion, 3 = + rutina fija, 4 = solo rutina fija con animacion (F10 cambia)
 
 // Recorre la lista de personajes del juego y arma la lista de modelos disponibles (solo en el hilo del juego).
 static void ScanCandidates()
@@ -1076,7 +1076,7 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		if (SafeRead(g_ghost.em + EM_FLAGS, &flags, 4))
 		{
 			uint32_t want = flags & ~FLAG_MOVE;
-			if (g_freezeMode >= 2) want |= FLAG_DISABLEMOTION; else want &= ~FLAG_DISABLEMOTION;
+			if (g_freezeMode == 2 || g_freezeMode == 3) want |= FLAG_DISABLEMOTION; else want &= ~FLAG_DISABLEMOTION;
 			if (want != flags)
 			{
 				SafeWrite(g_ghost.em + EM_FLAGS, &want, 4);
@@ -1092,13 +1092,20 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		{
 			if (!g_ghost.pinSet)
 			{
-				// Se guarda la rutina unos 7 segundos despues de crearlo (ya esta en su estado tranquilo).
-				if (g_ghost.frames > 400 &&
-					SafeRead(g_ghost.em + 0xFD, &g_ghost.pinR[0], 1) && SafeRead(g_ghost.em + 0xFE, &g_ghost.pinR[1], 1) &&
-					SafeRead(g_ghost.em + 0xFF, &g_ghost.pinR[2], 1))
+				// Ganado (0x12): la rutina que frena el ataque, segun las pruebas, es r1=18 r2=1 (la que usa cuando Leon
+				// se le acerca). Se fija en cuanto el Ganado entra en ella. Para otros modelos, se guarda la que tenga
+				// unos 7 segundos despues de crearlo.
+				uint8_t cr[3] = { 0, 0, 0 };
+				if (g_ghost.frames > 60 &&
+					SafeRead(g_ghost.em + 0xFD, &cr[0], 1) && SafeRead(g_ghost.em + 0xFE, &cr[1], 1) && SafeRead(g_ghost.em + 0xFF, &cr[2], 1))
 				{
-					g_ghost.pinSet = true;
-					Log("Modo 3: se fija la rutina del fantasma en r1=%u r2=%u r3=%u", (unsigned)g_ghost.pinR[0], (unsigned)g_ghost.pinR[1], (unsigned)g_ghost.pinR[2]);
+					bool capture = (g_ghost.id == 0x12) ? (cr[0] == 18 && cr[1] == 1) : (g_ghost.frames > 400);
+					if (capture)
+					{
+						memcpy(g_ghost.pinR, cr, 3);
+						g_ghost.pinSet = true;
+						Log("Modo %d: se fija la rutina del fantasma en r1=%u r2=%u r3=%u", g_freezeMode, (unsigned)cr[0], (unsigned)cr[1], (unsigned)cr[2]);
+					}
 				}
 			}
 			else
@@ -1214,10 +1221,11 @@ static void HandleHotkeys()
 	g_f8Prev = f8;
 	if (f10 && !g_f10Prev)
 	{
-		g_freezeMode = g_freezeMode % 3 + 1;
+		g_freezeMode = g_freezeMode % 4 + 1;
 		g_ghost.pinSet = false;
 		Log("F10: modo de inmovilizacion del fantasma = %d (%s)", g_freezeMode,
-			g_freezeMode == 1 ? "solo sin movimiento" : g_freezeMode == 2 ? "sin movimiento y sin animacion" : "sin movimiento, sin animacion y rutina fija");
+			g_freezeMode == 1 ? "solo sin movimiento" : g_freezeMode == 2 ? "sin movimiento y sin animacion" :
+			g_freezeMode == 3 ? "sin movimiento, sin animacion y rutina fija" : "sin movimiento y rutina fija, con animacion");
 		MessageBeep(MB_OK);
 	}
 
@@ -1454,7 +1462,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3e (v3c) iniciado");
+	Log("RE4 Coop - hito 3g (v3e) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,

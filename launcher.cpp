@@ -68,8 +68,8 @@ enum
 static const UINT_PTR kLobbyTimer = 1;
 static const UINT_PTR kRefreshTimer = 2;
 
-static const int kClientW = 460;
-static const int kClientH = 608;
+static const int kClientW = 700;
+static const int kClientH = 456;
 
 // ---------------------------------------------------------------- estado
 
@@ -846,75 +846,79 @@ static void ShortenPath(const char* path, char* out, size_t outSize)
 
 static void PaintAll(HDC dc)
 {
-	// fondo
 	RECT all = { 0, 0, kClientW, kClientH };
 	HBRUSH bg = CreateSolidBrush(cBg);
 	FillRect(dc, &all, bg);
 	DeleteObject(bg);
 
 	// cabecera
-	RECT head = { 0, 0, kClientW, 78 };
+	RECT head = { 0, 0, kClientW, 66 };
 	HBRUSH hb = CreateSolidBrush(cHeader);
 	FillRect(dc, &head, hb);
 	DeleteObject(hb);
-	RECT line = { 0, 76, kClientW, 79 };
+	RECT line = { 0, 64, kClientW, 67 };
 	HBRUSH ab = CreateSolidBrush(cAccent);
 	FillRect(dc, &line, ab);
 	DeleteObject(ab);
-	DrawTextAt(dc, "RE4 COOP", 24, 10, 300, 40, g_fTitle, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-	DrawTextAt(dc, "Resident Evil 4  -  multijugador por Radmin VPN", 26, 48, 410, 22, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+	DrawTextAt(dc, "RE4 COOP", 24, 8, 220, 32, g_fTitle, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+	DrawTextAt(dc, "Resident Evil 4  -  multijugador por Radmin VPN", 26, 40, 450, 18, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
 	bool lobby = g_lobby != LOBBY_IDLE;
 
-	// tarjeta del modo
-	RECT card = { 24, 158, kClientW - 24, 242 };
-	FillRoundRect(dc, card, 14, cCard, cCardEdge);
-
+	// ---- columna izquierda: tarjeta de IP
+	RECT card = { 24, 136, 344, 220 };
+	FillRoundRect(dc, card, 12, cCard, cCardEdge);
 	if (g_hostMode)
 	{
-		DrawTextAt(dc, "TU IP DE RADMIN", 44, 168, 250, 18, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+		DrawTextAt(dc, "TU IP DE RADMIN", 40, 146, 280, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 		if (g_radminIp[0])
 		{
-			DrawTextAt(dc, g_radminIp, 44, 188, 270, 34, g_fBig, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-			DrawTextAt(dc, "Pasale esta IP a tu amigo", 44, 220, 270, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+			DrawTextAt(dc, g_radminIp, 40, 164, 170, 30, g_fBig, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+			DrawTextAt(dc, "Pasale esta IP a tu amigo", 40, 196, 290, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 		}
 		else
 		{
-			DrawTextAt(dc, "No detectada", 44, 188, 270, 34, g_fBig, cWarn, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-			DrawTextAt(dc, "Abri Radmin VPN y conectate a la red", 44, 220, 280, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+			DrawTextAt(dc, "No detectada", 40, 164, 180, 30, g_fBig, cWarn, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+			DrawTextAt(dc, "Abri Radmin VPN y conectate a la red", 40, 196, 290, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 		}
 	}
 	else
 	{
-		DrawTextAt(dc, "IP DEL HOST (LA DE RADMIN DE TU AMIGO)", 44, 168, 380, 18, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+		DrawTextAt(dc, "IP DE RADMIN DEL HOST", 40, 146, 280, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 		if (!lobby)
 		{
-			RECT box = { 40, 192, 318, 228 };
+			RECT box = { 40, 166, 244, 198 };
 			FillRoundRect(dc, box, 8, cInput, cCardEdge);
+			DrawTextAt(dc, "La que ve tu amigo en esta ventana", 40, 200, 290, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 		}
 		else
 		{
 			char ipText[64];
 			GetEditText(g_editIp, ipText, sizeof(ipText));
-			DrawTextAt(dc, ipText, 44, 190, 330, 34, g_fBig, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+			DrawTextAt(dc, ipText, 40, 164, 290, 30, g_fBig, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 		}
 	}
 
+	// ---- columna izquierda: opciones
+	DrawTextAt(dc, "Puerto", 24, 302, 60, 26, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+	RECT pbox = { 84, 300, 164, 328 };
+	FillRoundRect(dc, pbox, 8, cInput, cCardEdge);
+
+	// ---- columna derecha: estado o sala de espera
 	if (lobby)
 	{
-		// banner de la sala de espera
-		RECT bn = { 24, 258, kClientW - 24, 392 };
-		FillRoundRect(dc, bn, 14, cCard, cAccent);
-		DrawTextAt(dc, "SALA DE ESPERA", 44, 270, 300, 18, g_fSmall, cAccent, DT_LEFT | DT_SINGLELINE);
-		DrawTextAt(dc, g_banner, 44, 296, kClientW - 88, 84, g_fNormal, cText, DT_LEFT | DT_WORDBREAK);
+		RECT bn = { 368, 84, kClientW - 24, 250 };
+		FillRoundRect(dc, bn, 12, cCard, cAccent);
+		DrawTextAt(dc, "SALA DE ESPERA", 386, 96, 260, 16, g_fSmall, cAccent, DT_LEFT | DT_SINGLELINE);
+		DrawTextAt(dc, g_banner, 386, 122, kClientW - 24 - 386 - 14, 118, g_fNormal, cText, DT_LEFT | DT_WORDBREAK);
 	}
 	else
 	{
-		// estado
 		char text[160];
 		COLORREF col;
+		DrawTextAt(dc, "ESTADO", 368, 86, 200, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+		const int tx = 392, tw = kClientW - 24 - 392;
 
-		// juego
 		if (g_gameDir[0])
 		{
 			char shortPath[96];
@@ -924,13 +928,12 @@ static void PaintAll(HDC dc)
 		}
 		else
 		{
-			snprintf(text, sizeof(text), "No encuentro bio4.exe (toca 'Buscar juego...')");
+			snprintf(text, sizeof(text), "No encuentro bio4.exe");
 			col = cBad;
 		}
-		DrawDot(dc, 34, 270, col);
-		DrawTextAt(dc, text, 50, 260, kClientW - 80, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+		DrawDot(dc, 376, 118, col);
+		DrawTextAt(dc, text, tx, 108, tw, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-		// mod
 		if (!g_gameDir[0])
 		{
 			snprintf(text, sizeof(text), "Mod: -");
@@ -943,40 +946,32 @@ static void PaintAll(HDC dc)
 		}
 		else if (g_modState == 2)
 		{
-			snprintf(text, sizeof(text), "Mod desactualizado (hay uno nuevo junto al lanzador)");
+			snprintf(text, sizeof(text), "Mod desactualizado");
 			col = cWarn;
 		}
 		else
 		{
-			snprintf(text, sizeof(text), g_canInstall ? "Mod sin instalar (se puede instalar con un boton)" : "Falta dinput8.dll en la carpeta del juego");
+			snprintf(text, sizeof(text), "Mod sin instalar");
 			col = cBad;
 		}
-		DrawDot(dc, 34, 298, col);
-		DrawTextAt(dc, text, 50, 288, kClientW - 190, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+		DrawDot(dc, 376, 146, col);
+		DrawTextAt(dc, text, tx, 136, tw, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-		// radmin
 		if (g_radminIp[0])
 		{
-			snprintf(text, sizeof(text), "Radmin VPN conectado (%s)", g_radminIp);
+			snprintf(text, sizeof(text), "Radmin conectado (%s)", g_radminIp);
 			col = cOk;
 		}
 		else
 		{
-			snprintf(text, sizeof(text), "Radmin VPN no detectado");
+			snprintf(text, sizeof(text), "Radmin no detectado");
 			col = cWarn;
 		}
-		DrawDot(dc, 34, 326, col);
-		DrawTextAt(dc, text, 50, 316, kClientW - 80, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-		// opciones
-		DrawTextAt(dc, "OPCIONES", 24, 348, 200, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
-		DrawTextAt(dc, "Puerto", 24, 412, 70, 30, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-		RECT pbox = { 92, 410, 176, 440 };
-		FillRoundRect(dc, pbox, 8, cInput, cCardEdge);
+		DrawDot(dc, 376, 174, col);
+		DrawTextAt(dc, text, tx, 164, tw, 20, g_fNormal, cText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 	}
 
-	// pie
-	DrawTextAt(dc, "Dentro del juego: F7 abre el panel de conexion", 24, kClientH - 24, 410, 18, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
+	DrawTextAt(dc, "Dentro del juego: F7 abre el panel de conexion", 24, kClientH - 24, 450, 16, g_fSmall, cMuted, DT_LEFT | DT_SINGLELINE);
 }
 
 static bool IsToggleOn(int id)
@@ -1093,36 +1088,33 @@ static HWND MakeEdit(int id, int x, int y, int w, int h)
 	HWND c = CreateWindowExA(0, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, x, y, w, h, g_hwnd,
 		reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleA(nullptr), nullptr);
 	if (c)
-		SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_fBig), TRUE);
+		SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_fNormal), TRUE);
 	return c;
 }
 
 static void CreateControls()
 {
-	g_modeHost = MakeButton("CREAR PARTIDA", ID_MODE_HOST, 24, 94, 204, 46);
-	g_modeJoin = MakeButton("UNIRME", ID_MODE_JOIN, 232, 94, 204, 46);
+	g_modeHost = MakeButton("CREAR PARTIDA", ID_MODE_HOST, 24, 84, 156, 40);
+	g_modeJoin = MakeButton("UNIRME", ID_MODE_JOIN, 188, 84, 156, 40);
 
-	// IP del host (modo unirse): la caja se dibuja en PaintAll; el campo va adentro, sin borde
-	g_editIp = MakeEdit(ID_EDIT_IP, 48, 198, 262, 26);
-	g_btnPaste = MakeButton("Pegar", ID_BTN_PASTE, 334, 192, 86, 36);
-	g_btnCopy = MakeButton("Copiar IP", ID_BTN_COPY, 322, 190, 98, 38);
+	g_editIp = MakeEdit(ID_EDIT_IP, 48, 173, 188, 20);
+	g_btnPaste = MakeButton("Pegar", ID_BTN_PASTE, 254, 164, 72, 36);
+	g_btnCopy = MakeButton("Copiar IP", ID_BTN_COPY, 238, 162, 92, 34);
 
-	g_tglGhost = MakeButton("Mostrar al otro jugador (fantasma)", ID_TGL_GHOST, 24, 370, 412, 30);
-	g_tglWait = MakeButton("Esperar a mi amigo antes de abrir el juego", ID_TGL_WAIT, 24, 450, 412, 30);
+	g_tglGhost = MakeButton("Mostrar al otro jugador (fantasma)", ID_TGL_GHOST, 24, 234, 320, 26);
+	g_tglWait = MakeButton("Esperar a mi amigo antes de abrir", ID_TGL_WAIT, 24, 266, 320, 26);
+	g_editPort = MakeEdit(ID_EDIT_PORT, 92, 305, 64, 20);
 
-	// el puerto va en la caja dibujada
-	g_editPort = MakeEdit(ID_EDIT_PORT, 100, 414, 70, 22);
-
-	g_btnPlay = MakeButton("JUGAR", ID_BTN_PLAY, 24, 488, 412, 52);
-	g_btnCancel = MakeButton("CANCELAR", ID_BTN_CANCEL, 24, 420, 412, 52);
-	ShowWindow(g_btnCancel, SW_HIDE);
-
-	g_btnInstall = MakeButton("Instalar mod", ID_BTN_INSTALL, 330, 284, 106, 28);
+	g_btnInstall = MakeButton("Instalar / actualizar mod", ID_BTN_INSTALL, 368, 194, 308, 30);
 	ShowWindow(g_btnInstall, SW_HIDE);
 
-	g_btnSave = MakeButton("Solo guardar", ID_BTN_SAVE, 24, 552, 132, 32);
-	g_btnBrowse = MakeButton("Buscar juego...", ID_BTN_BROWSE, 164, 552, 132, 32);
-	g_btnDirect = MakeButton("Sin Steam", ID_BTN_DIRECT, 304, 552, 132, 32);
+	g_btnPlay = MakeButton("JUGAR", ID_BTN_PLAY, 24, 342, 652, 48);
+	g_btnCancel = MakeButton("CANCELAR", ID_BTN_CANCEL, 24, 342, 652, 48);
+	ShowWindow(g_btnCancel, SW_HIDE);
+
+	g_btnSave = MakeButton("Solo guardar", ID_BTN_SAVE, 24, 398, 210, 28);
+	g_btnBrowse = MakeButton("Buscar juego...", ID_BTN_BROWSE, 245, 398, 210, 28);
+	g_btnDirect = MakeButton("Sin Steam", ID_BTN_DIRECT, 466, 398, 210, 28);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1258,11 +1250,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nShow)
 	GetModuleFileNameA(nullptr, g_exeDir, MAX_PATH);
 	StripToDirectory(g_exeDir);
 
-	g_fNormal = MakeFont(-16, FW_NORMAL);
-	g_fSmall = MakeFont(-13, FW_NORMAL);
-	g_fBig = MakeFont(-24, FW_SEMIBOLD);
-	g_fTitle = MakeFont(-32, FW_BOLD);
-	g_fBtn = MakeFont(-17, FW_BOLD);
+	g_fNormal = MakeFont(-14, FW_NORMAL);
+	g_fSmall = MakeFont(-12, FW_NORMAL);
+	g_fBig = MakeFont(-20, FW_SEMIBOLD);
+	g_fTitle = MakeFont(-26, FW_BOLD);
+	g_fBtn = MakeFont(-15, FW_BOLD);
 	g_brInput = CreateSolidBrush(cInput);
 
 	WNDCLASSA wc;

@@ -321,6 +321,7 @@ struct Config
 	int modelId;           // [fantasma] modelo
 	bool updateMatrix;     // [fantasma] actualizar_matriz
 	bool killOnHang;       // [fantasma] cerrar_si_se_cuelga
+	bool leonClone;        // [fantasma] tipo = leon (clon de Leon, sin necesitar enemigos) o ganado
 };
 
 static void WriteDefaultConfig(const char* path)
@@ -360,6 +361,11 @@ static bool LoadConfig(Config& cfg)
 	cfg.ghostOnStart = GetPrivateProfileIntA("fantasma", "activo", 0, path) != 0;
 	cfg.updateMatrix = GetPrivateProfileIntA("fantasma", "actualizar_matriz", 1, path) != 0;
 	cfg.killOnHang = GetPrivateProfileIntA("fantasma", "cerrar_si_se_cuelga", 1, path) != 0;
+	{
+		char tipo[32];
+		GetPrivateProfileStringA("fantasma", "tipo", "leon", tipo, sizeof(tipo), path);
+		cfg.leonClone = _stricmp(tipo, "ganado") != 0;
+	}
 	char modelText[32];
 	GetPrivateProfileStringA("fantasma", "modelo", "0x10", modelText, sizeof(modelText), path);
 	cfg.modelId = (int)strtoul(modelText, nullptr, 0);
@@ -391,8 +397,8 @@ static bool LoadConfig(Config& cfg)
 		return false;
 	}
 
-	Log("Configuracion: modo=%s ip='%s' puerto=%d | fantasma: activo=%d modelo=0x%02X matriz=%d cerrar_si_se_cuelga=%d",
-		cfg.isHost ? "host" : "client", cfg.ip, cfg.port, cfg.ghostOnStart ? 1 : 0, cfg.modelId, cfg.updateMatrix ? 1 : 0,
+	Log("Configuracion: modo=%s ip='%s' puerto=%d | fantasma: tipo=%s activo=%d modelo=0x%02X matriz=%d cerrar_si_se_cuelga=%d",
+		cfg.isHost ? "host" : "client", cfg.ip, cfg.port, cfg.leonClone ? "leon" : "ganado", cfg.ghostOnStart ? 1 : 0, cfg.modelId, cfg.updateMatrix ? 1 : 0,
 		cfg.killOnHang ? 1 : 0);
 	return true;
 }
@@ -1018,6 +1024,52 @@ static void PutShort(uint8_t* base, int offset, int value)
 	memcpy(base + offset, &v, 2);
 }
 
+// Diagnostico (3o): anota las funciones virtuales del clon y de Leon para encontrar la que "piensa y mueve" al jugador.
+static void DumpVtables(uintptr_t cloneEm)
+{
+	uintptr_t cloneVt = 0, leonVt = 0, leonEm = 0;
+	SafeRead(cloneEm, &cloneVt, 4);
+	if (g_plGlobal) SafeRead(g_plGlobal, &leonEm, 4);
+	if (leonEm > 0x10000) SafeRead(leonEm, &leonVt, 4);
+	HMODULE exe = GetModuleHandleA(nullptr);
+	Log("VTABLE: base del exe=0x%08X clon em=0x%08X vtable=0x%08X | Leon em=0x%08X vtable=0x%08X (%s)",
+		(unsigned)(uintptr_t)exe, (unsigned)cloneEm, (unsigned)cloneVt, (unsigned)leonEm, (unsigned)leonVt,
+		cloneVt == leonVt ? "la misma" : "distintas");
+	uintptr_t vt = cloneVt ? cloneVt : leonVt;
+	if (!vt) return;
+	char line[600];
+	for (int row = 0; row < 8; row++)
+	{
+		line[0] = 0;
+		size_t n = 0;
+		for (int i = 0; i < 8; i++)
+		{
+			uint32_t fn = 0;
+			SafeRead(vt + (row * 8 + i) * 4, &fn, 4);
+			n += snprintf(line + n, sizeof(line) - n, "%08X ", (unsigned)fn);
+		}
+		Log("VTABLE[%02d..%02d]: %s", row * 8, row * 8 + 7, line);
+	}
+	// Los primeros 0x60 bytes del clon y de Leon (para ver que campos copia el clon de Leon).
+	for (int who = 0; who < 2; who++)
+	{
+		uintptr_t e = who == 0 ? cloneEm : leonEm;
+		if (e < 0x10000) continue;
+		for (int row = 0; row < 3; row++)
+		{
+			line[0] = 0;
+			size_t n = 0;
+			for (int i = 0; i < 8; i++)
+			{
+				uint32_t v = 0;
+				SafeRead(e + (row * 8 + i) * 4, &v, 4);
+				n += snprintf(line + n, sizeof(line) - n, "%08X ", (unsigned)v);
+			}
+			Log("%s[+%02X]: %s", who == 0 ? "CLON " : "LEON ", row * 32, line);
+		}
+	}
+}
+
 static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 {
 	// Elegimos el modelo entre los que ya estan cargados en la sala (se vuelve a mirar justo ahora).
@@ -1160,6 +1212,9 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	SafeRead(em + EM_FLAGS, &flags, 4);
 	SafeRead(em + EM_RNO0, &rno0, 1);
 	Log("Fantasma CREADO: em=0x%08X guid=%u flags=0x%X r_no_0=%u", (unsigned)em, (unsigned)guid, (unsigned)flags, (unsigned)rno0);
+
+	if (g_ghost.isClone)
+		DumpVtables(em);
 
 	memcpy(g_ghost.pos, snap.pos, sizeof(g_ghost.pos));
 	g_ghost.yaw = snap.yaw;
@@ -1623,10 +1678,10 @@ static void HandleHotkeys()
 		g_skinMode = (g_skinMode + 1) % 2;
 		// 3l: en vez del Leon jugador (0x00, que pelea por la camara y copia tus controles), se prueba el id 0x02
 		// ("Leon de eventos", el de las escenas: no tiene logica de jugador ni lee el control).
-		if (g_skinMode == 1) g_forceId = 0x02;
+		if (g_skinMode == 1) g_forceId = 0x00;
 		else { g_forceId = -1; g_skinMode = 0; }
 		g_spawnFails = 0;
-		Log("F11: skin de prueba = %s", g_skinMode == 0 ? "normal (copia del enemigo)" : "Leon de eventos (id 0x02)");
+		Log("F11: skin de prueba = %s", g_skinMode == 0 ? "Ganado (copia del enemigo)" : "clon de Leon (id 0x00)");
 		GhostDespawn();
 		MessageBeep(MB_OK);
 	}
@@ -1928,7 +1983,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3n (v3l) iniciado");
+	Log("RE4 Coop - hito 3o (v3m) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -1983,6 +2038,8 @@ void ModMain()
 	g_updateMatrix = cfgOk ? cfg.updateMatrix : true;
 	g_killOnHang = cfgOk ? cfg.killOnHang : true;
 	g_ghostEnabled = cfgOk && cfg.ghostOnStart && ghostPossible;
+	if (cfgOk && cfg.leonClone) { g_skinMode = 1; g_forceId = 0x00; }
+	Log("Tipo de fantasma: %s (F11 cambia entre clon de Leon y Ganado)", g_forceId >= 0 ? "clon de Leon (aparece solo, sin enemigos)" : "Ganado (necesita un enemigo vivo)");
 	Log("Modelo preferido del fantasma: 0x%02X (%s). Solo se crea si ya hay un enemigo igual vivo en la sala. "
 		"Teclas: F8 = activar/desactivar, F9 = cambiar entre los modelos disponibles.",
 		g_wantedId, ModelName(g_wantedId));

@@ -409,13 +409,15 @@ struct NetPacket
 	float pos[3];
 	float yaw;
 	uint16_t room;    // sala actual del jugador
-	uint16_t reserved;
+	uint16_t echoDelay; // ms que pasaron desde que recibi tickSend del otro hasta que mande este paquete (para el ping)
+	uint32_t tickSend;  // mi reloj (GetTickCount) al enviar este paquete
+	uint32_t echoTick;  // el tickSend del ultimo paquete que recibi del otro (0 = ninguno todavia)
 };
 #pragma pack(pop)
-static_assert(sizeof(NetPacket) == 32, "tamano inesperado del paquete");
+static_assert(sizeof(NetPacket) == 40, "tamano inesperado del paquete");
 
 static const uint32_t NET_MAGIC = 0x43344552u;
-static const uint16_t NET_VERSION = 2; // 2 = incluye la sala
+static const uint16_t NET_VERSION = 3; // 3 = incluye datos para medir el ping
 static const uint16_t FLAG_IN_GAME = 1;
 
 #ifndef SIO_UDP_CONNRESET
@@ -427,6 +429,7 @@ static sockaddr_in g_peer;
 static bool g_peerKnown = false;
 static bool g_isHost = false;
 static bool g_warnedVersion = false;
+static bool g_netOk = false;   // la red esta funcionando (la maneja el hilo de red; el panel F7 pide cambios con g_req)
 
 struct RemoteState
 {
@@ -438,6 +441,11 @@ struct RemoteState
 	float yaw;
 	uint16_t room;
 	int packetsThisSecond;
+	uint32_t theirTick;       // ultimo tickSend recibido del otro
+	DWORD theirTickAt;        // cuando lo recibi (mi reloj)
+	int pingMs;               // ping suavizado en ms (-1 = todavia no se pudo medir)
+	DWORD firstConnectTick;   // cuando se conecto por primera vez en esta sesion de red
+	char peerText[48];        // direccion del otro jugador, para mostrar
 };
 static RemoteState g_remote;
 static CRITICAL_SECTION g_remoteLock; // el hilo de red escribe, el hilo del juego lee
@@ -514,6 +522,20 @@ static bool NetInit(const Config& cfg)
 	return true;
 }
 
+static void NetStop()
+{
+	if (g_sock != INVALID_SOCKET)
+	{
+		closesocket(g_sock);
+		g_sock = INVALID_SOCKET;
+	}
+	g_peerKnown = false;
+	g_netOk = false;
+	EnterCriticalSection(&g_remoteLock);
+	memset(&g_remote, 0, sizeof(g_remote));
+	LeaveCriticalSection(&g_remoteLock);
+}
+
 static void NetSend(const NetPacket& p)
 {
 	if (!g_peerKnown)
@@ -568,6 +590,23 @@ static void NetReceive()
 		g_remote.yaw = p.yaw;
 		g_remote.room = p.room;
 		g_remote.packetsThisSecond++;
+		{
+			DWORD nowTick = GetTickCount();
+			g_remote.theirTick = p.tickSend;
+			g_remote.theirTickAt = nowTick;
+			if (!hadReceived)
+			{
+				g_remote.firstConnectTick = nowTick;
+				g_remote.pingMs = -1;
+				AddrToString(from, g_remote.peerText, sizeof(g_remote.peerText));
+			}
+			if (p.echoTick != 0)
+			{
+				uint32_t rtt = (uint32_t)nowTick - p.echoTick - (uint32_t)p.echoDelay;
+				if (rtt < 5000)
+					g_remote.pingMs = (g_remote.pingMs < 0) ? (int)rtt : (g_remote.pingMs * 3 + (int)rtt) / 4;
+			}
+		}
 		LeaveCriticalSection(&g_remoteLock);
 
 		if (!wasConnected)
@@ -1261,6 +1300,301 @@ static DWORD g_gameThreadId = 0;
 static int g_tickCount = 0;       // ticks desde el ultimo resumen del log
 static int g_tickFaults = 0;
 
+
+// ---------------------------------------------------------------- panel de conexion (tecla F7)
+// Una ventanita propia (en su propio hilo) para crear la partida o unirse sin reiniciar el juego.
+// El panel solo deja un pedido en g_req; el hilo de red lo aplica (abre o cierra el socket).
+struct ConnRequest
+{
+	bool pending;
+	bool disconnect;
+	bool host;
+	char ip[64];
+	int port;
+};
+static ConnRequest g_req;
+static CRITICAL_SECTION g_reqLock;
+
+static void ApplyConnRequest()
+{
+	ConnRequest r;
+	EnterCriticalSection(&g_reqLock);
+	if (!g_req.pending)
+	{
+		LeaveCriticalSection(&g_reqLock);
+		return;
+	}
+	r = g_req;
+	g_req.pending = false;
+	LeaveCriticalSection(&g_reqLock);
+
+	NetStop();
+	if (r.disconnect)
+	{
+		Log("Panel F7: desconectado");
+		return;
+	}
+
+	Config c;
+	memset(&c, 0, sizeof(c));
+	c.isHost = r.host;
+	snprintf(c.ip, sizeof(c.ip), "%s", r.ip);
+	c.port = r.port;
+	Log("Panel F7: %s (ip='%s' puerto=%d)", r.host ? "crear partida (host)" : "unirse (client)", c.ip, c.port);
+	g_netOk = NetInit(c);
+	if (!g_netOk)
+	{
+		NetStop();
+		Log("Panel F7: no se pudo abrir la conexion (mira los mensajes de arriba)");
+	}
+}
+
+enum
+{
+	PID_RADIO_HOST = 301, PID_RADIO_JOIN, PID_LABEL_IP, PID_EDIT_IP, PID_LABEL_PORT, PID_EDIT_PORT,
+	PID_BTN_CONNECT, PID_BTN_DISCONNECT, PID_STATUS, PID_HINT, PID_LIST
+};
+static const UINT WM_COOP_PANEL_TOGGLE = WM_APP + 0x4D;
+static const UINT_PTR kPanelTimer = 7;
+static volatile HWND g_panelWnd = nullptr;
+static volatile LONG g_panelThreadStarted = 0;
+static HWND p_radioHost, p_radioJoin, p_labelIp, p_editIp, p_editPort, p_status, p_list;
+
+static HWND PanelControl(HWND parent, const char* cls, const char* text, DWORD style, DWORD ex, int x, int y, int w, int h, int id)
+{
+	HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+		(HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+	if (c)
+		SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+	return c;
+}
+
+static void PanelUpdateEnabled()
+{
+	bool join = SendMessageA(p_radioJoin, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	EnableWindow(p_labelIp, join);
+	EnableWindow(p_editIp, join);
+}
+
+static void PanelUpdateStatus()
+{
+	char text[200];
+	bool net = g_netOk;
+	bool host = g_isHost;
+	EnterCriticalSection(&g_remoteLock);
+	bool connected = g_remote.connected;
+	LeaveCriticalSection(&g_remoteLock);
+	if (!net)
+		snprintf(text, sizeof(text), "Estado: desconectado.");
+	else if (host)
+		snprintf(text, sizeof(text), connected ? "Estado: partida creada, tu amigo esta conectado." :
+			"Estado: partida creada, esperando a tu amigo...");
+	else
+		snprintf(text, sizeof(text), connected ? "Estado: conectado al host." : "Estado: buscando al host...");
+	SetWindowTextA(p_status, text);
+
+	// Lista de jugadores conectados.
+	char list[512];
+	EnterCriticalSection(&g_remoteLock);
+	RemoteState r = g_remote;
+	LeaveCriticalSection(&g_remoteLock);
+	int n = snprintf(list, sizeof(list), "Jugadores conectados:\r\n  1. Vos (%s)", host ? "host" : "cliente");
+	if (net && r.connected)
+	{
+		DWORD secs = (GetTickCount() - r.firstConnectTick) / 1000;
+		char ping[24];
+		if (r.pingMs >= 0)
+			snprintf(ping, sizeof(ping), "%d ms", r.pingMs);
+		else
+			snprintf(ping, sizeof(ping), "midiendo...");
+		snprintf(list + n, sizeof(list) - n, "\r\n  2. Amigo - %s - ping %s - conectado hace %lu:%02lu - %s",
+			r.peerText[0] ? r.peerText : "?", ping, (unsigned long)(secs / 60), (unsigned long)(secs % 60),
+			(r.flags & FLAG_IN_GAME) ? "en juego" : "en menu");
+	}
+	else
+	{
+		snprintf(list + n, sizeof(list) - n, "\r\n  (nadie mas conectado)");
+	}
+	SetWindowTextA(p_list, list);
+}
+
+static void PanelConnect()
+{
+	bool host = SendMessageA(p_radioHost, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	char ipText[64];
+	GetWindowTextA(p_editIp, ipText, sizeof(ipText));
+	char portText[16];
+	GetWindowTextA(p_editPort, portText, sizeof(portText));
+	int port = atoi(portText);
+
+	in_addr probe;
+	if (!host && inet_pton(AF_INET, ipText, &probe) != 1)
+	{
+		SetWindowTextA(p_status, "La IP no es valida. Tiene que ser como 26.123.45.67 (la IP de Radmin del host).");
+		return;
+	}
+	if (port < 1024 || port > 65535)
+	{
+		SetWindowTextA(p_status, "El puerto no es valido (usar entre 1024 y 65535, normalmente 27015).");
+		return;
+	}
+
+	// Se guarda en el .ini para la proxima vez.
+	char iniPath[MAX_PATH];
+	if (ExeDirFile("re4coop.ini", iniPath, MAX_PATH))
+	{
+		WritePrivateProfileStringA("coop", "modo", host ? "host" : "client", iniPath);
+		if (!host)
+			WritePrivateProfileStringA("coop", "ip", ipText, iniPath);
+		WritePrivateProfileStringA("coop", "puerto", portText, iniPath);
+	}
+
+	EnterCriticalSection(&g_reqLock);
+	g_req.pending = true;
+	g_req.disconnect = false;
+	g_req.host = host;
+	snprintf(g_req.ip, sizeof(g_req.ip), "%s", host ? "" : ipText);
+	g_req.port = port;
+	LeaveCriticalSection(&g_reqLock);
+	SetWindowTextA(p_status, "Conectando...");
+}
+
+static void PanelDisconnect()
+{
+	EnterCriticalSection(&g_reqLock);
+	g_req.pending = true;
+	g_req.disconnect = true;
+	LeaveCriticalSection(&g_reqLock);
+}
+
+static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg)
+	{
+	case WM_COMMAND:
+		switch (LOWORD(wParam))
+		{
+		case PID_RADIO_HOST:
+		case PID_RADIO_JOIN:
+			PanelUpdateEnabled();
+			return 0;
+		case PID_BTN_CONNECT:
+			PanelConnect();
+			return 0;
+		case PID_BTN_DISCONNECT:
+			PanelDisconnect();
+			return 0;
+		}
+		break;
+	case WM_TIMER:
+		if (wParam == kPanelTimer && IsWindowVisible(hwnd))
+			PanelUpdateStatus();
+		return 0;
+	case WM_COOP_PANEL_TOGGLE:
+		if (IsWindowVisible(hwnd))
+		{
+			ShowWindow(hwnd, SW_HIDE);
+			if (g_hwnd)
+				SetForegroundWindow(g_hwnd);
+		}
+		else
+		{
+			PanelUpdateStatus();
+			ShowWindow(hwnd, SW_SHOW);
+			SetForegroundWindow(hwnd);
+		}
+		return 0;
+	case WM_CLOSE:
+		ShowWindow(hwnd, SW_HIDE); // la X solo oculta el panel
+		if (g_hwnd)
+			SetForegroundWindow(g_hwnd);
+		return 0;
+	}
+	return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static DWORD WINAPI PanelThread(LPVOID)
+{
+	WNDCLASSA wc;
+	memset(&wc, 0, sizeof(wc));
+	wc.lpfnWndProc = PanelProc;
+	wc.hInstance = GetModuleHandleA(nullptr);
+	wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+	wc.hbrBackground = (HBRUSH)(INT_PTR)(COLOR_BTNFACE + 1);
+	wc.lpszClassName = "RE4CoopPanel";
+	RegisterClassA(&wc);
+
+	HWND w = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "RE4CoopPanel", "RE4 Coop - Conexion (F7)",
+		WS_POPUP | WS_CAPTION | WS_SYSMENU, 40, 40, 380, 340, nullptr, nullptr, wc.hInstance, nullptr);
+	if (!w)
+	{
+		Log("AVISO: no se pudo crear la ventana del panel F7");
+		return 0;
+	}
+
+	p_radioHost = PanelControl(w, "BUTTON", "Crear partida (yo soy el host)", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 0, 14, 12, 340, 22, PID_RADIO_HOST);
+	p_radioJoin = PanelControl(w, "BUTTON", "Unirme a la partida de mi amigo", BS_AUTORADIOBUTTON, 0, 14, 36, 340, 22, PID_RADIO_JOIN);
+	p_labelIp = PanelControl(w, "STATIC", "IP de Radmin del host:", SS_LEFT, 0, 14, 70, 140, 18, PID_LABEL_IP);
+	p_editIp = PanelControl(w, "EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 160, 66, 194, 22, PID_EDIT_IP);
+	PanelControl(w, "STATIC", "Puerto:", SS_LEFT, 0, 14, 100, 140, 18, PID_LABEL_PORT);
+	p_editPort = PanelControl(w, "EDIT", "27015", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 160, 96, 80, 22, PID_EDIT_PORT);
+	PanelControl(w, "BUTTON", "Conectar", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 14, 132, 160, 30, PID_BTN_CONNECT);
+	PanelControl(w, "BUTTON", "Desconectar", BS_PUSHBUTTON | WS_TABSTOP, 0, 194, 132, 160, 30, PID_BTN_DISCONNECT);
+	p_status = PanelControl(w, "STATIC", "", SS_LEFT, 0, 14, 172, 346, 34, PID_STATUS);
+	p_list = PanelControl(w, "STATIC", "", SS_LEFT, 0, 14, 212, 346, 78, PID_LIST);
+	PanelControl(w, "STATIC", "F7 muestra/oculta este panel. La X solo lo oculta.", SS_LEFT, 0, 14, 300, 346, 18, PID_HINT);
+
+	// Valores de la ultima vez (del .ini).
+	bool host = g_isHost;
+	char ip[64] = "";
+	int port = 27015;
+	char iniPath[MAX_PATH];
+	if (ExeDirFile("re4coop.ini", iniPath, MAX_PATH))
+	{
+		GetPrivateProfileStringA("coop", "ip", "", ip, sizeof(ip), iniPath);
+		port = (int)GetPrivateProfileIntA("coop", "puerto", 27015, iniPath);
+	}
+	SendMessageA(host ? p_radioHost : p_radioJoin, BM_SETCHECK, BST_CHECKED, 0);
+	SetWindowTextA(p_editIp, ip);
+	char portText[16];
+	snprintf(portText, sizeof(portText), "%d", port);
+	SetWindowTextA(p_editPort, portText);
+	PanelUpdateEnabled();
+	PanelUpdateStatus();
+
+	SetTimer(w, kPanelTimer, 500, nullptr);
+	g_panelWnd = w;
+	ShowWindow(w, SW_SHOW);
+	SetForegroundWindow(w);
+	Log("Panel F7 abierto");
+
+	MSG m;
+	while (GetMessageA(&m, nullptr, 0, 0) > 0)
+	{
+		if (!IsDialogMessageA(w, &m))
+		{
+			TranslateMessage(&m);
+			DispatchMessageA(&m);
+		}
+	}
+	return 0;
+}
+
+static void TogglePanel()
+{
+	if (InterlockedCompareExchange(&g_panelThreadStarted, 1, 0) == 0)
+	{
+		HANDLE h = CreateThread(nullptr, 0, PanelThread, nullptr, 0, nullptr);
+		if (h)
+			CloseHandle(h);
+		return;
+	}
+	HWND w = g_panelWnd;
+	if (w)
+		PostMessageA(w, WM_COOP_PANEL_TOGGLE, 0, 0);
+}
+
+static bool g_f7Prev = false;
 static bool g_f8Prev = false;
 static bool g_f9Prev = false;
 static bool g_f10Prev = false;
@@ -1270,6 +1604,10 @@ static void HandleHotkeys()
 {
 	// Solo cuando la ventana del juego tiene el foco (si no, escribir en otra ventana activaria cosas).
 	bool focused = (GetForegroundWindow() == g_hwnd);
+	bool f7 = focused && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+	if (f7 && !g_f7Prev)
+		TogglePanel();
+	g_f7Prev = f7;
 	bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
 	bool f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 	bool f10 = focused && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -1283,10 +1621,12 @@ static void HandleHotkeys()
 		Log("F11: ids reales en memoria: Leon=%s0x%02X Ashley=%s0x%02X", haveLeon ? "" : "(no leido) ", haveLeon ? leonId : 0,
 			haveAsh ? "" : "(no leido) ", haveAsh ? ashId : 0);
 		g_skinMode = (g_skinMode + 1) % 2;
-		if (g_skinMode == 1 && haveLeon) g_forceId = leonId;
+		// 3l: en vez del Leon jugador (0x00, que pelea por la camara y copia tus controles), se prueba el id 0x02
+		// ("Leon de eventos", el de las escenas: no tiene logica de jugador ni lee el control).
+		if (g_skinMode == 1) g_forceId = 0x02;
 		else { g_forceId = -1; g_skinMode = 0; }
 		g_spawnFails = 0;
-		Log("F11: skin de prueba = %s", g_skinMode == 0 ? "normal (copia del enemigo)" : "clon de Leon (con el puntero protegido)");
+		Log("F11: skin de prueba = %s", g_skinMode == 0 ? "normal (copia del enemigo)" : "Leon de eventos (id 0x02)");
 		GhostDespawn();
 		MessageBeep(MB_OK);
 	}
@@ -1588,8 +1928,9 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3k (v3i) iniciado");
+	Log("RE4 Coop - hito 3n (v3l) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
+	InitializeCriticalSection(&g_reqLock);
 
 	// El .exe de Steam puede tardar unos segundos en dejar su codigo listo,
 	// asi que reintentamos hasta 10 veces (cada 3 segundos) antes de rendirnos.
@@ -1629,12 +1970,12 @@ void ModMain()
 			g_pGvar ? 1 : 0, g_emMgr ? 1 : 0, g_EmSetEvent ? 1 : 0);
 
 	// Red: si algo falla, el mod sigue funcionando pero solo anota a Leon (sin conexion).
-	bool netOk = false;
+	g_netOk = false;
 	Config cfg;
 	bool cfgOk = LoadConfig(cfg);
 	if (cfgOk)
-		netOk = NetInit(cfg);
-	if (!netOk)
+		g_netOk = NetInit(cfg);
+	if (!g_netOk)
 		Log("AVISO: sin conexion. Revisa re4coop.ini y los mensajes de arriba.");
 
 	// Fantasma: modelo preferido y enganche de la ventana.
@@ -1671,6 +2012,7 @@ void ModMain()
 	for (;;)
 	{
 		Sleep(2);
+		ApplyConnRequest();
 		DWORD now = GetTickCount();
 
 		// Vigilancia: si el juego lleva mucho tiempo dentro de una llamada arriesgada, esta colgado. Este hilo
@@ -1731,7 +2073,7 @@ void ModMain()
 		// Red: 20 veces por segundo.
 		PlayerInfo leon = {};
 		bool leonOk = false;
-		if (netOk && now - lastNet >= 50)
+		if (g_netOk && now - lastNet >= 50)
 		{
 			lastNet = now;
 			leonOk = ReadPlayer(g_plGlobal, &leon);
@@ -1743,6 +2085,15 @@ void ModMain()
 			p.flags = inGame ? FLAG_IN_GAME : 0;
 			p.seq = seq++;
 			p.room = ReadRoomNow();
+			{
+				DWORD t = GetTickCount();
+				p.tickSend = (uint32_t)t;
+				EnterCriticalSection(&g_remoteLock);
+				p.echoTick = g_remote.theirTick;
+				DWORD delay = g_remote.theirTick ? (t - g_remote.theirTickAt) : 0;
+				LeaveCriticalSection(&g_remoteLock);
+				p.echoDelay = (uint16_t)(delay > 65535 ? 65535 : delay);
+			}
 			if (leonOk)
 			{
 				memcpy(p.pos, leon.pos, sizeof(p.pos));
@@ -1814,7 +2165,7 @@ void ModMain()
 			}
 		}
 
-		if (netOk)
+		if (g_netOk)
 		{
 			EnterCriticalSection(&g_remoteLock);
 			RemoteState r = g_remote;
@@ -1823,9 +2174,9 @@ void ModMain()
 
 			if (r.connected)
 			{
-				Log("AMIGO   %s pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X paquetes/s=%d",
+				Log("AMIGO   %s pos=(%.1f, %.1f, %.1f) giro=%.2f sala=0x%04X paquetes/s=%d ping=%d ms",
 					(r.flags & FLAG_IN_GAME) ? "en juego" : "en menu  ",
-					r.pos[0], r.pos[1], r.pos[2], r.yaw, (unsigned)r.room, r.packetsThisSecond);
+					r.pos[0], r.pos[1], r.pos[2], r.yaw, (unsigned)r.room, r.packetsThisSecond, r.pingMs);
 			}
 		}
 

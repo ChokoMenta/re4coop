@@ -1070,6 +1070,101 @@ static void DumpVtables(uintptr_t cloneEm)
 	}
 }
 
+// ---------------------------------------------------------------- 3p: tabla de funciones propia para el clon
+// El clon de Leon comparte con Leon la misma tabla de funciones virtuales (22 entradas). Le damos al clon una COPIA de la tabla
+// y, con F6, vamos anulando de a una funcion SOLO para el clon (la funcion anulada no hace nada y devuelve 0).
+// Asi se descubre cual es la que lo hace copiar tus controles / pelear por la camara / deformar las manos.
+static const int kVtSlots = 22;
+static uint32_t g_vtCopy[kVtSlots];
+static uint32_t g_slotOrig[kVtSlots];
+static int g_slotRet[kVtSlots];       // bytes de argumentos que limpia la funcion (-1 = no se pudo saber: no se prueba)
+static bool g_vtReady = false;
+static uint8_t* g_stubMem = nullptr;
+static int g_testSlot = -1;           // -1 = ninguna anulada, 0..21 = esa, 99 = todas las seguras (menos la 0)
+
+// Lee el codigo de la funcion y busca como termina ("pop ...; ret" o "pop ...; ret N") para saber cuantos bytes de argumentos limpia.
+static int AnalyzeRet(uint32_t fn, uint32_t* realFn)
+{
+	uint32_t a = fn;
+	for (int hop = 0; hop < 4; hop++)
+	{
+		uint8_t b[5];
+		if (!SafeRead(a, b, 5)) return -1;
+		if (b[0] != 0xE9) break;
+		int32_t rel = 0;
+		memcpy(&rel, b + 1, 4);
+		a = a + 5 + (uint32_t)rel;
+	}
+	*realFn = a;
+	static uint8_t buf[0x600];
+	size_t got = 0;
+	while (got < sizeof(buf))
+	{
+		if (!SafeRead(a + got, buf + got, 64)) break;
+		got += 64;
+	}
+	int val = -2;
+	int cc = 0;
+	for (size_t i = 1; i + 2 < got; i++)
+	{
+		if (buf[i] == 0xCC) { if (++cc >= 3 && i > 8) break; } else cc = 0;
+		uint8_t p = buf[i - 1];
+		bool pop = (p >= 0x58 && p <= 0x5F) || p == 0xC9;
+		if (!pop) continue;
+		int n = -2;
+		if (buf[i] == 0xC3) n = 0;
+		else if (buf[i] == 0xC2 && buf[i + 2] == 0) n = buf[i + 1];
+		if (n == -2) continue;
+		if (val == -2) val = n;
+		else if (val != n) return -1;
+	}
+	return val == -2 ? -1 : val;
+}
+
+static void ApplyTestSlot()
+{
+	if (!g_vtReady || !g_stubMem) return;
+	for (int i = 0; i < kVtSlots; i++)
+	{
+		bool disable = (g_testSlot == i) || (g_testSlot == 99 && i != 0);
+		if (disable && g_slotRet[i] >= 0)
+		{
+			uint8_t* st = g_stubMem + i * 8;
+			if (g_slotRet[i] == 0) { st[0] = 0x33; st[1] = 0xC0; st[2] = 0xC3; }
+			else { st[0] = 0x33; st[1] = 0xC0; st[2] = 0xC2; st[3] = (uint8_t)g_slotRet[i]; st[4] = 0x00; }
+			g_vtCopy[i] = (uint32_t)(uintptr_t)st;
+		}
+		else
+			g_vtCopy[i] = g_slotOrig[i];
+	}
+}
+
+static void SetupCloneVtable(uintptr_t em)
+{
+	uintptr_t vt = 0;
+	if (!SafeRead(em, &vt, 4) || vt < 0x10000) return;
+	if (!g_vtReady)
+	{
+		if (!g_stubMem)
+			g_stubMem = (uint8_t*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (!g_stubMem) { Log("VTABLE: no pude reservar memoria para las funciones de prueba"); return; }
+		for (int i = 0; i < kVtSlots; i++)
+		{
+			g_slotOrig[i] = 0;
+			SafeRead(vt + i * 4, &g_slotOrig[i], 4);
+			uint32_t real = 0;
+			g_slotRet[i] = g_slotOrig[i] ? AnalyzeRet(g_slotOrig[i], &real) : -1;
+			Log("SLOT %02d: tabla=0x%08X codigo=0x%08X ret=%s%d", i, (unsigned)g_slotOrig[i], (unsigned)real,
+				g_slotRet[i] < 0 ? "?" : "", g_slotRet[i]);
+		}
+		g_vtReady = true;
+	}
+	ApplyTestSlot();
+	uint32_t p = (uint32_t)(uintptr_t)g_vtCopy;
+	if (SafeWrite(em, &p, 4))
+		Log("VTABLE: el clon usa una copia de la tabla (funcion anulada ahora: %d)", g_testSlot);
+}
+
 static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 {
 	// Elegimos el modelo entre los que ya estan cargados en la sala (se vuelve a mirar justo ahora).
@@ -1214,7 +1309,10 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 	Log("Fantasma CREADO: em=0x%08X guid=%u flags=0x%X r_no_0=%u", (unsigned)em, (unsigned)guid, (unsigned)flags, (unsigned)rno0);
 
 	if (g_ghost.isClone)
+	{
 		DumpVtables(em);
+		SetupCloneVtable(em);
+	}
 
 	memcpy(g_ghost.pos, snap.pos, sizeof(g_ghost.pos));
 	g_ghost.yaw = snap.yaw;
@@ -1654,6 +1752,8 @@ static bool g_f8Prev = false;
 static bool g_f9Prev = false;
 static bool g_f10Prev = false;
 static bool g_f11Prev = false;
+static bool g_f6Prev = false;
+static int g_testIdx = 0;
 
 static void HandleHotkeys()
 {
@@ -1663,6 +1763,25 @@ static void HandleHotkeys()
 	if (f7 && !g_f7Prev)
 		TogglePanel();
 	g_f7Prev = f7;
+	bool f6 = focused && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+	if (f6 && !g_f6Prev)
+	{
+		static const int kSeq[] = { -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 0, 99 };
+		const int n = (int)(sizeof(kSeq) / sizeof(kSeq[0]));
+		bool back = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+		for (int tries = 0; tries < n; tries++)
+		{
+			g_testIdx = (g_testIdx + (back ? n - 1 : 1)) % n;
+			int sl = kSeq[g_testIdx];
+			if (sl < 0 || sl == 99 || !g_vtReady || g_slotRet[sl] >= 0)
+				break;
+		}
+		g_testSlot = kSeq[g_testIdx];
+		ApplyTestSlot();
+		Log("F6: funcion anulada para el clon = %d (%s)", g_testSlot, g_testSlot < 0 ? "ninguna" : (g_testSlot == 99 ? "todas las seguras" : "solo esa"));
+		Beep(300 + g_testIdx * 30, 120);
+	}
+	g_f6Prev = f6;
 	bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
 	bool f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 	bool f10 = focused && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -1983,7 +2102,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3o (v3m) iniciado");
+	Log("RE4 Coop - hito 3p (v3n) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2245,10 +2364,10 @@ void ModMain()
 			ReadGameState(&rno0, &room, &frame);
 			if (lastFrame == 0)
 				lastFrame = frame;
-			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X disponibles=%d rno0=%u",
+			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X disponibles=%d rno0=%u anulada=%d",
 				g_tickCount, (unsigned)(frame - lastFrame),
 				g_ghostEnabled ? "ON" : "off", g_ghost.em ? " (creado)" : "",
-				(unsigned)g_wantedId, g_candCount, (unsigned)rno0);
+				(unsigned)g_wantedId, g_candCount, (unsigned)rno0, g_testSlot);
 			lastFrame = frame;
 			g_tickCount = 0;
 		}

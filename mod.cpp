@@ -1156,23 +1156,13 @@ static void SetupCloneVtable(uintptr_t em)
 			uint32_t real = 0;
 			g_slotRet[i] = g_slotOrig[i] ? AnalyzeRet(g_slotOrig[i], &real) : -1;
 			g_slotReal[i] = real;
+			// 3r: estas funciones se estudiaron a mano con el volcado del 3q: todas terminan con "ret" simple (0 bytes de argumentos).
+			if (g_slotRet[i] < 0 && (i == 7 || i == 8 || i == 9 || i == 12 || i == 19 || i == 20 || i == 21))
+				g_slotRet[i] = 0;
 			Log("SLOT %02d: tabla=0x%08X codigo=0x%08X ret=%s%d", i, (unsigned)g_slotOrig[i], (unsigned)real,
 				g_slotRet[i] < 0 ? "?" : "", g_slotRet[i]);
 		}
 		g_vtReady = true;
-		// 3q: de las funciones cuyo final no se pudo reconocer, se anota el codigo para estudiarlo aparte.
-		for (int i = 0; i < kVtSlots; i++)
-		{
-			if (g_slotRet[i] >= 0 || !g_slotReal[i]) continue;
-			for (int row = 0; row < 24; row++)
-			{
-				uint8_t b[32];
-				if (!SafeRead(g_slotReal[i] + row * 32, b, 32)) break;
-				char hx[32 * 3 + 1];
-				for (int k = 0; k < 32; k++) snprintf(hx + k * 3, 4, "%02X ", b[k]);
-				Log("CODIGO slot %02d +%03X: %s", i, row * 32, hx);
-			}
-		}
 	}
 	ApplyTestSlot();
 	uint32_t p = (uint32_t)(uintptr_t)g_vtCopy;
@@ -1781,7 +1771,7 @@ static void HandleHotkeys()
 	bool f6 = focused && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 	if (f6 && !g_f6Prev)
 	{
-		static const int kSeq[] = { -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 0, 99 };
+		static const int kSeq[] = { -1, 12, 7, 20, 21, 9, 8, 19, 99 };
 		const int n = (int)(sizeof(kSeq) / sizeof(kSeq[0]));
 		bool back = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 		for (int tries = 0; tries < n; tries++)
@@ -2117,7 +2107,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3q (v3o) iniciado");
+	Log("RE4 Coop - hito 3r (v3p) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 

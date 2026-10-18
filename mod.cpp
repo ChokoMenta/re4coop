@@ -1077,6 +1077,7 @@ static void DumpVtables(uintptr_t cloneEm)
 static const int kVtSlots = 22;
 static uint32_t g_vtCopy[kVtSlots];
 static uint32_t g_slotOrig[kVtSlots];
+static uint32_t g_slotReal[kVtSlots];
 static int g_slotRet[kVtSlots];       // bytes de argumentos que limpia la funcion (-1 = no se pudo saber: no se prueba)
 static bool g_vtReady = false;
 static uint8_t* g_stubMem = nullptr;
@@ -1154,10 +1155,24 @@ static void SetupCloneVtable(uintptr_t em)
 			SafeRead(vt + i * 4, &g_slotOrig[i], 4);
 			uint32_t real = 0;
 			g_slotRet[i] = g_slotOrig[i] ? AnalyzeRet(g_slotOrig[i], &real) : -1;
+			g_slotReal[i] = real;
 			Log("SLOT %02d: tabla=0x%08X codigo=0x%08X ret=%s%d", i, (unsigned)g_slotOrig[i], (unsigned)real,
 				g_slotRet[i] < 0 ? "?" : "", g_slotRet[i]);
 		}
 		g_vtReady = true;
+		// 3q: de las funciones cuyo final no se pudo reconocer, se anota el codigo para estudiarlo aparte.
+		for (int i = 0; i < kVtSlots; i++)
+		{
+			if (g_slotRet[i] >= 0 || !g_slotReal[i]) continue;
+			for (int row = 0; row < 24; row++)
+			{
+				uint8_t b[32];
+				if (!SafeRead(g_slotReal[i] + row * 32, b, 32)) break;
+				char hx[32 * 3 + 1];
+				for (int k = 0; k < 32; k++) snprintf(hx + k * 3, 4, "%02X ", b[k]);
+				Log("CODIGO slot %02d +%03X: %s", i, row * 32, hx);
+			}
+		}
 	}
 	ApplyTestSlot();
 	uint32_t p = (uint32_t)(uintptr_t)g_vtCopy;
@@ -2102,7 +2117,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3p (v3n) iniciado");
+	Log("RE4 Coop - hito 3q (v3o) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 

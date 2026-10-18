@@ -1081,6 +1081,7 @@ static uint32_t g_slotReal[kVtSlots];
 static int g_slotRet[kVtSlots];       // bytes de argumentos que limpia la funcion (-1 = no se pudo saber: no se prueba)
 static bool g_vtReady = false;
 static uint8_t* g_stubMem = nullptr;
+static uint32_t g_clearMask = 0;      // 3s: bits que se le borran al clon en cada tick (F5)
 static int g_testSlot = -1;           // -1 = ninguna anulada, 0..21 = esa, 99 = todas las seguras (menos la 0)
 
 // Lee el codigo de la funcion y busca como termina ("pop ...; ret" o "pop ...; ret N") para saber cuantos bytes de argumentos limpia.
@@ -1370,6 +1371,7 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		{
 			uint32_t want = flags & ~FLAG_MOVE;
 			if (g_freezeMode == 2 || g_freezeMode == 3) want |= FLAG_DISABLEMOTION; else want &= ~FLAG_DISABLEMOTION;
+			if (g_ghost.isClone && g_clearMask) want &= ~g_clearMask; // 3s: prueba de banderas (F5)
 			if (want != flags)
 			{
 				SafeWrite(g_ghost.em + EM_FLAGS, &want, 4);
@@ -1758,6 +1760,8 @@ static bool g_f9Prev = false;
 static bool g_f10Prev = false;
 static bool g_f11Prev = false;
 static bool g_f6Prev = false;
+static bool g_f5Prev = false;
+static int g_maskIdx = 0;
 static int g_testIdx = 0;
 
 static void HandleHotkeys()
@@ -1768,6 +1772,23 @@ static void HandleHotkeys()
 	if (f7 && !g_f7Prev)
 		TogglePanel();
 	g_f7Prev = f7;
+	bool f5 = focused && (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+	if (f5 && !g_f5Prev)
+	{
+		static const uint32_t kMasks[] = { 0, 0x04000000, 0x02000000, 0x01000000, 0x07000000, 0x00002000, 0x00000040, 0x00000010, 0x00000004, 0x00000002 };
+		const int n = (int)(sizeof(kMasks) / sizeof(kMasks[0]));
+		g_maskIdx = (g_maskIdx + 1) % n;
+		g_clearMask = kMasks[g_maskIdx];
+		uint32_t fl = 0;
+		if (g_ghost.em && SafeRead(g_ghost.em + EM_FLAGS, &fl, 4))
+		{
+			fl &= ~g_clearMask;
+			SafeWrite(g_ghost.em + EM_FLAGS, &fl, 4);
+		}
+		Log("F5: bits que se le borran al clon = 0x%08X (prueba %d de %d)", (unsigned)g_clearMask, g_maskIdx, n - 1);
+		Beep(500 + g_maskIdx * 40, 120);
+	}
+	g_f5Prev = f5;
 	bool f6 = focused && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 	if (f6 && !g_f6Prev)
 	{
@@ -2107,7 +2128,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3r (v3p) iniciado");
+	Log("RE4 Coop - hito 3s (v3q) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2369,10 +2390,10 @@ void ModMain()
 			ReadGameState(&rno0, &room, &frame);
 			if (lastFrame == 0)
 				lastFrame = frame;
-			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X disponibles=%d rno0=%u anulada=%d",
+			Log("ESTADO  ticks=%d frames=%u fantasma=%s%s modelo=0x%02X disponibles=%d rno0=%u anulada=%d bits=0x%08X",
 				g_tickCount, (unsigned)(frame - lastFrame),
 				g_ghostEnabled ? "ON" : "off", g_ghost.em ? " (creado)" : "",
-				(unsigned)g_wantedId, g_candCount, (unsigned)rno0, g_testSlot);
+				(unsigned)g_wantedId, g_candCount, (unsigned)rno0, g_testSlot, (unsigned)g_clearMask);
 			lastFrame = frame;
 			g_tickCount = 0;
 		}

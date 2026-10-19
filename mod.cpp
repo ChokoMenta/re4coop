@@ -1171,6 +1171,63 @@ static void SetupCloneVtable(uintptr_t em)
 		Log("VTABLE: el clon usa una copia de la tabla (funcion anulada ahora: %d)", g_testSlot);
 }
 
+// ---------------------------------------------------------------- 3t: camara
+// La camara del juego (CameraControl) guarda a que modelo esta "pegada": m_p_model_10[3] (+0x10..+0x18) y m_p_attach_model_old_1C (+0x1C).
+// Hipotesis: al crearse, el clon (que es un jugador completo) pega la camara a si mismo. Aca la devolvemos a Leon.
+static uintptr_t g_camCtrl = 0;
+static uintptr_t g_camSnap[4] = { 0, 0, 0, 0 };
+static int g_camRestores = 0;
+static bool g_cloneMotion = true;   // 3t: el clon NO lleva la bandera "sin animacion" (F3 la alterna)
+
+static void CamLog(const char* when)
+{
+	if (!g_camCtrl) return;
+	uintptr_t m[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < 3; i++) SafeRead(g_camCtrl + 0x10 + 4 * i, &m[i], 4);
+	SafeRead(g_camCtrl + 0x1C, &m[3], 4);
+	uint8_t at[3] = { 0, 0, 0 };
+	SafeRead(g_camCtrl + 0x00, &at[0], 1);
+	SafeRead(g_camCtrl + 0x01, &at[1], 1);
+	SafeRead(g_camCtrl + 0x02, &at[2], 1);
+	uint32_t bf = 0, sf = 0, st = 0;
+	SafeRead(g_camCtrl + 0x28, &bf, 4);
+	SafeRead(g_camCtrl + 0x2C, &sf, 4);
+	SafeRead(g_camCtrl + 0x30, &st, 4);
+	Log("CAMARA (%s): modelo[0]=0x%08X modelo[1]=0x%08X modelo[2]=0x%08X anterior=0x%08X adj=%u/%u/%u flag28=0x%X sys2C=0x%X est30=0x%X",
+		when, (unsigned)m[0], (unsigned)m[1], (unsigned)m[2], (unsigned)m[3], at[0], at[1], at[2], (unsigned)bf, (unsigned)sf, (unsigned)st);
+}
+
+static void CamSnapshot()
+{
+	if (!g_camCtrl) return;
+	for (int i = 0; i < 3; i++) SafeRead(g_camCtrl + 0x10 + 4 * i, &g_camSnap[i], 4);
+	SafeRead(g_camCtrl + 0x1C, &g_camSnap[3], 4);
+}
+
+// Si la camara quedo pegada al clon, se la devuelve a lo que tenia antes (o a Leon).
+static int CamRestore(uintptr_t cloneEm)
+{
+	if (!g_camCtrl || !cloneEm) return 0;
+	int fixed = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		uintptr_t a = g_camCtrl + (i < 3 ? 0x10 + 4 * i : 0x1C);
+		uintptr_t cur = 0;
+		if (!SafeRead(a, &cur, 4) || cur != cloneEm) continue;
+		uintptr_t back = g_camSnap[i];
+		if (back == cloneEm || (i == 0 && back == 0)) back = g_realLeon;
+		SafeWrite(a, &back, 4);
+		fixed++;
+	}
+	if (fixed)
+	{
+		g_camRestores += fixed;
+		if (g_camRestores <= 8 || g_camRestores % 600 == 0)
+			Log("CAMARA: estaba pegada al clon, se devolvio a Leon (veces: %d)", g_camRestores);
+	}
+	return fixed;
+}
+
 static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 {
 	// Elegimos el modelo entre los que ya estan cargados en la sala (se vuelve a mirar justo ahora).
@@ -1253,6 +1310,7 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 		}
 	}
 	uintptr_t em = 0;
+	if (g_forceId >= 0) { CamSnapshot(); CamLog("antes de crear el clon"); }
 	g_riskId = id;
 	g_riskCode = 1;
 	g_riskStart = GetTickCount();
@@ -1276,6 +1334,12 @@ static void GhostSpawn(const RemoteSnap& snap, uint16_t room)
 			Log("PRUEBA DE SKIN: el juego habia cambiado el puntero de Leon a 0x%08X; se devolvio al verdadero 0x%08X",
 				(unsigned)cur, (unsigned)g_realLeon);
 		}
+	}
+
+	if (g_forceId >= 0 && em)
+	{
+		CamLog("justo despues de crear el clon");
+		CamRestore(em);
 	}
 
 	// Comprobamos que el resultado sea un personaje valido de la lista del juego.
@@ -1371,6 +1435,7 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		{
 			uint32_t want = flags & ~FLAG_MOVE;
 			if (g_freezeMode == 2 || g_freezeMode == 3) want |= FLAG_DISABLEMOTION; else want &= ~FLAG_DISABLEMOTION;
+			if (g_ghost.isClone && g_cloneMotion) want &= ~FLAG_DISABLEMOTION; // 3t: el clon anima (no queda en T-pose)
 			if (g_ghost.isClone && g_clearMask) want &= ~g_clearMask; // 3s: prueba de banderas (F5)
 			if (want != flags)
 			{
@@ -1761,6 +1826,7 @@ static bool g_f10Prev = false;
 static bool g_f11Prev = false;
 static bool g_f6Prev = false;
 static bool g_f5Prev = false;
+static bool g_f3Prev = false;
 static int g_maskIdx = 0;
 static int g_testIdx = 0;
 
@@ -1772,6 +1838,14 @@ static void HandleHotkeys()
 	if (f7 && !g_f7Prev)
 		TogglePanel();
 	g_f7Prev = f7;
+	bool f3 = focused && (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+	if (f3 && !g_f3Prev)
+	{
+		g_cloneMotion = !g_cloneMotion;
+		Log("F3: el clon %s", g_cloneMotion ? "ANIMA (sin bandera de congelado)" : "queda CONGELADO (T-pose)");
+		Beep(g_cloneMotion ? 900 : 400, 120);
+	}
+	g_f3Prev = f3;
 	bool f5 = focused && (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
 	if (f5 && !g_f5Prev)
 	{
@@ -1792,7 +1866,7 @@ static void HandleHotkeys()
 	bool f6 = focused && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 	if (f6 && !g_f6Prev)
 	{
-		static const int kSeq[] = { -1, 12, 7, 20, 21, 9, 8, 19, 99 };
+		static const int kSeq[] = { -1, 4, 12, 7, 20, 21, 9, 8, 19, 99 };
 		const int n = (int)(sizeof(kSeq) / sizeof(kSeq[0]));
 		bool back = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 		for (int tries = 0; tries < n; tries++)
@@ -1908,6 +1982,10 @@ static void GhostUpdate(float dt)
 				Log("PRUEBA DE SKIN: el puntero de Leon apuntaba al clon, se devolvio al verdadero (veces: %d)", g_leonRestores);
 		}
 	}
+
+	// 3t: si la camara se pega al clon, se la devolvemos a Leon en cada tick.
+	if (g_ghost.em && g_ghost.isClone)
+		CamRestore(g_ghost.em);
 
 	// Al cambiar de sala (o mientras el juego no esta en su bucle principal) esperamos un poco
 	// antes de crear nada: el juego esta cargando y destruyendo personajes.
@@ -2128,7 +2206,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3s (v3q) iniciado");
+	Log("RE4 Coop - hito 3t (v3r) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2143,6 +2221,7 @@ void ModMain()
 		g_plGlobal = FindGlobalPointer("Leon (pPL)", "A1 ? ? ? ? D8 CC D8 C9 D8 CA D9 5D ? D9 45 ?", 1);
 		g_asGlobal = FindGlobalPointer("Ashley (pAS)", "A8 02 74 16 8B 15", 6);
 		g_pGvar = FindGlobalPointer("Datos globales (pG)", "A1 ? ? ? ? B9 FF FF FF 7F 21 48 ? A1", 1);
+		g_camCtrl = FindGlobalPointer("Camara (CamCtrl)", "D9 EE B9 ? ? ? ? D9 9E A4 00 00 00 E8 ? ? ? ? D9 EE", 3);
 		g_emMgr = FindGlobalPointer("Lista de personajes (EmMgr)", "81 E1 01 02 00 00 83 F9 01 75 ? 50 B9 ? ? ? ? E8", 0xD);
 	}
 
@@ -2311,6 +2390,8 @@ void ModMain()
 			continue;
 		lastLog = now;
 
+		if (g_ghost.em && g_ghost.isClone)
+			CamLog("periodico");
 		leonOk = ReadPlayer(g_plGlobal, &leon);
 		if (leonOk)
 		{

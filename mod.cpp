@@ -1082,6 +1082,8 @@ static int g_slotRet[kVtSlots];       // bytes de argumentos que limpia la funci
 static bool g_vtReady = false;
 static uint8_t* g_stubMem = nullptr;
 static uint32_t g_clearMask = 0;      // 3s: bits que se le borran al clon en cada tick (F5)
+static int g_testIdx = 0;
+static bool g_autoFreezeMove = true;  // 3u: despues de inicializarse, al clon se le anula move() (la camara deja de pelear)
 static int g_testSlot = -1;           // -1 = ninguna anulada, 0..21 = esa, 99 = todas las seguras (menos la 0)
 
 // Lee el codigo de la funcion y busca como termina ("pop ...; ret" o "pop ...; ret N") para saber cuantos bytes de argumentos limpia.
@@ -1165,6 +1167,7 @@ static void SetupCloneVtable(uintptr_t em)
 		}
 		g_vtReady = true;
 	}
+	if (g_autoFreezeMove) { g_testSlot = -1; g_testIdx = 0; } // se anula move() recien cuando el clon termino de inicializarse
 	ApplyTestSlot();
 	uint32_t p = (uint32_t)(uintptr_t)g_vtCopy;
 	if (SafeWrite(em, &p, 4))
@@ -1403,6 +1406,15 @@ static float AngleDiff(float a, float b)
 static void GhostMove(const RemoteSnap& snap, float dt)
 {
 	g_ghost.frames++;
+
+	// 3u: pasados unos frames (el clon ya se inicializo), se le anula move(): asi no copia tus controles ni toca la camara.
+	if (g_ghost.isClone && g_autoFreezeMove && g_ghost.frames == 40 && g_vtReady && g_testSlot != 4)
+	{
+		g_testSlot = 4;
+		g_testIdx = 1;
+		ApplyTestSlot();
+		Log("CLON: se anulo move() (funcion 4) para que no pelee por la camara ni copie tus controles");
+	}
 
 	// Cuando el personaje termino de inicializarse, le quitamos el movimiento propio (IA/animacion).
 	if (!g_ghost.frozen)
@@ -1827,8 +1839,8 @@ static bool g_f11Prev = false;
 static bool g_f6Prev = false;
 static bool g_f5Prev = false;
 static bool g_f3Prev = false;
+static bool g_f4Prev = false;
 static int g_maskIdx = 0;
-static int g_testIdx = 0;
 
 static void HandleHotkeys()
 {
@@ -1838,6 +1850,16 @@ static void HandleHotkeys()
 	if (f7 && !g_f7Prev)
 		TogglePanel();
 	g_f7Prev = f7;
+	bool f4 = focused && (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+	if (f4 && !g_f4Prev)
+	{
+		g_autoFreezeMove = !g_autoFreezeMove;
+		if (!g_autoFreezeMove) { g_testSlot = -1; g_testIdx = 0; ApplyTestSlot(); }
+		else if (g_ghost.em && g_ghost.isClone) { g_testSlot = 4; g_testIdx = 1; ApplyTestSlot(); }
+		Log("F4: anular move() del clon automaticamente = %s", g_autoFreezeMove ? "SI" : "NO");
+		Beep(g_autoFreezeMove ? 800 : 350, 120);
+	}
+	g_f4Prev = f4;
 	bool f3 = focused && (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
 	if (f3 && !g_f3Prev)
 	{
@@ -2206,7 +2228,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3t (v3r) iniciado");
+	Log("RE4 Coop - hito 3u (v3s) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 

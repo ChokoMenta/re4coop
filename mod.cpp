@@ -1200,6 +1200,26 @@ static void CamLog(const char* when)
 		when, (unsigned)m[0], (unsigned)m[1], (unsigned)m[2], (unsigned)m[3], at[0], at[1], at[2], (unsigned)bf, (unsigned)sf, (unsigned)st);
 }
 
+// 3v: a quien "mira" la camara: posicion del jugador que usa la camara (matriz del modo sobre el hombro) y objetivo de la camara,
+// comparados con la posicion de Leon y del clon.
+static void CamDiag()
+{
+	if (!g_camCtrl || !g_ghost.em) return;
+	float pl[3] = { 0, 0, 0 }, camPos[3] = { 0, 0, 0 }, camTgt[3] = { 0, 0, 0 }, leon[3] = { 0, 0, 0 }, clon[3] = { 0, 0, 0 };
+	SafeRead(g_camCtrl + 0x3F0 + 0x0C, &pl[0], 4);
+	SafeRead(g_camCtrl + 0x3F0 + 0x1C, &pl[1], 4);
+	SafeRead(g_camCtrl + 0x3F0 + 0x2C, &pl[2], 4);
+	SafeRead(g_camCtrl + 0x104, camPos, 12);
+	SafeRead(g_camCtrl + 0x110, camTgt, 12);
+	uintptr_t le = 0;
+	if (g_plGlobal) SafeRead(g_plGlobal, &le, 4);
+	if (le > 0x10000) SafeRead(le + 0x94, leon, 12);
+	SafeRead(g_ghost.em + 0x94, clon, 12);
+	auto d = [](const float* a, const float* b) { float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2]; return sqrtf(x * x + y * y + z * z); };
+	Log("CAMARA-DIAG: jugador_de_camara=(%.0f,%.0f,%.0f) a_Leon=%.0f a_clon=%.0f | objetivo=(%.0f,%.0f,%.0f) a_Leon=%.0f a_clon=%.0f | camara_a_Leon=%.0f",
+		pl[0], pl[1], pl[2], d(pl, leon), d(pl, clon), camTgt[0], camTgt[1], camTgt[2], d(camTgt, leon), d(camTgt, clon), d(camPos, leon));
+}
+
 static void CamSnapshot()
 {
 	if (!g_camCtrl) return;
@@ -2009,6 +2029,21 @@ static void GhostUpdate(float dt)
 	if (g_ghost.em && g_ghost.isClone)
 		CamRestore(g_ghost.em);
 
+	// 3v: si el juego le devuelve al clon la tabla de funciones original, se la volvemos a poner (si no, move() vuelve a correr).
+	if (g_ghost.em && g_ghost.isClone && g_vtReady)
+	{
+		uint32_t vt = 0;
+		uint32_t mine = (uint32_t)(uintptr_t)g_vtCopy;
+		if (SafeRead(g_ghost.em, &vt, 4) && vt != mine)
+		{
+			SafeWrite(g_ghost.em, &mine, 4);
+			static int s_vtFixes = 0;
+			s_vtFixes++;
+			if (s_vtFixes <= 10 || s_vtFixes % 300 == 0)
+				Log("CLON: el juego le habia cambiado la tabla de funciones (0x%08X); se la volvi a poner (veces: %d)", (unsigned)vt, s_vtFixes);
+		}
+	}
+
 	// Al cambiar de sala (o mientras el juego no esta en su bucle principal) esperamos un poco
 	// antes de crear nada: el juego esta cargando y destruyendo personajes.
 	if (room != g_lastRoom || rno0 != RNO0_MAINLOOP)
@@ -2228,7 +2263,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3u (v3s) iniciado");
+	Log("RE4 Coop - hito 3v (v3t) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2413,7 +2448,10 @@ void ModMain()
 		lastLog = now;
 
 		if (g_ghost.em && g_ghost.isClone)
+		{
 			CamLog("periodico");
+			CamDiag();
+		}
 		leonOk = ReadPlayer(g_plGlobal, &leon);
 		if (leonOk)
 		{

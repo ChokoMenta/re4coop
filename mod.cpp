@@ -406,6 +406,21 @@ static bool LoadConfig(Config& cfg)
 // ---------------------------------------------------------------- red (UDP)
 
 #pragma pack(push, 1)
+// 3w: estado de animacion de Leon. Los punteros son distintos en cada PC, asi que se mandan como distancia
+// a un punto de referencia (la tabla de movimientos del jugador) y un hash de los primeros bytes del clip para verificar.
+struct MotPart
+{
+	int32_t dFcv, dHerm, dJno, dJkind; // puntero - referencia
+	uint32_t hash;      // hash de 32 bytes del clip (verifica que el receptor encontro el mismo clip)
+	float frameMax, frame, speed;
+	uint16_t attr, state;
+	uint32_t flag;
+	int16_t tblIdx;     // indice del clip en la tabla de movimientos (-1 = no esta)
+	uint8_t tblSel;     // 0 = tabla +0x46C, 1 = tabla +0x470
+	uint8_t jointNum;
+	uint8_t valid;
+	uint8_t pad[3];
+};
 struct NetPacket
 {
 	uint32_t magic;   // numero fijo para reconocer nuestros paquetes
@@ -418,12 +433,14 @@ struct NetPacket
 	uint16_t echoDelay; // ms que pasaron desde que recibi tickSend del otro hasta que mande este paquete (para el ping)
 	uint32_t tickSend;  // mi reloj (GetTickCount) al enviar este paquete
 	uint32_t echoTick;  // el tickSend del ultimo paquete que recibi del otro (0 = ninguno todavia)
+	MotPart mot;
 };
 #pragma pack(pop)
-static_assert(sizeof(NetPacket) == 40, "tamano inesperado del paquete");
+static_assert(sizeof(MotPart) == 48, "tamano inesperado de MotPart");
+static_assert(sizeof(NetPacket) == 88, "tamano inesperado del paquete");
 
 static const uint32_t NET_MAGIC = 0x43344552u;
-static const uint16_t NET_VERSION = 3; // 3 = incluye datos para medir el ping
+static const uint16_t NET_VERSION = 4; // 4 = incluye la animacion de Leon (3 = ping)
 static const uint16_t FLAG_IN_GAME = 1;
 
 #ifndef SIO_UDP_CONNRESET
@@ -452,6 +469,8 @@ struct RemoteState
 	int pingMs;               // ping suavizado en ms (-1 = todavia no se pudo medir)
 	DWORD firstConnectTick;   // cuando se conecto por primera vez en esta sesion de red
 	char peerText[48];        // direccion del otro jugador, para mostrar
+	MotPart mot;              // 3w: animacion del otro
+	uint32_t motStamp;        // sube con cada paquete recibido
 };
 static RemoteState g_remote;
 static CRITICAL_SECTION g_remoteLock; // el hilo de red escribe, el hilo del juego lee
@@ -595,6 +614,8 @@ static void NetReceive()
 		memcpy(g_remote.pos, p.pos, sizeof(g_remote.pos));
 		g_remote.yaw = p.yaw;
 		g_remote.room = p.room;
+		g_remote.mot = p.mot;
+		g_remote.motStamp++;
 		g_remote.packetsThisSecond++;
 		{
 			DWORD nowTick = GetTickCount();
@@ -643,6 +664,8 @@ struct RemoteSnap
 	float pos[3];
 	float yaw;
 	uint16_t room;
+	MotPart mot;
+	uint32_t motStamp;
 };
 
 static RemoteSnap GetRemoteSnap()
@@ -657,6 +680,8 @@ static RemoteSnap GetRemoteSnap()
 		memcpy(s.pos, g_remote.pos, sizeof(s.pos));
 		s.yaw = g_remote.yaw;
 		s.room = g_remote.room;
+		s.mot = g_remote.mot;
+		s.motStamp = g_remote.motStamp;
 	}
 	LeaveCriticalSection(&g_remoteLock);
 	return s;
@@ -1174,6 +1199,313 @@ static void SetupCloneVtable(uintptr_t em)
 		Log("VTABLE: el clon usa una copia de la tabla (funcion anulada ahora: %d)", g_testSlot);
 }
 
+// ---------------------------------------------------------------- 3w: animacion
+// MOTION_INFO de un personaje: cEm + 0x1D8 (0xD0 bytes). Campos: +0 clip, +4 hermite, +8 historial (24 bytes), +0x20 frame max,
+// +0x24 frame, +0x28/+0x2C frame anterior, +0x30 cantidad de huesos, +0x34 lista de huesos, +0x38 tipo de canal, +0x40 attr, +0x42 estado, +0x44 flag,
+// +0xC0 velocidad.
+static const uintptr_t EM_MOTION = 0x1D8;
+static const uintptr_t EM_MOTTBL1 = 0x46C;
+static const uintptr_t EM_MOTTBL2 = 0x470;
+
+static uintptr_t g_motMoveFn = 0;    // MotionMoveCore(pEm, pInfo): evalua el clip y pone la pose de los huesos
+static int g_motMoveRet = -1;        // bytes de argumentos que limpia la funcion (-1 = no se pudo saber)
+static bool g_motEval = true;        // F2 (modo 2): llamar a la funcion que evalua la animacion
+static bool g_motApply = true;       // F2 (modo 1): aplicar la animacion recibida al clon
+static int g_motApplied = 0, g_motHashFail = 0, g_motEvalCalls = 0, g_motEvalFail = 0, g_motNoClip = 0;
+
+static uint32_t Fnv32(const uint8_t* p, int n)
+{
+	uint32_t h = 2166136261u;
+	for (int i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+	return h;
+}
+
+static bool HashAt(uintptr_t a, uint32_t* out)
+{
+	uint8_t b[32];
+	if (a < 0x10000 || !SafeRead(a, b, 32)) return false;
+	*out = Fnv32(b, 32);
+	return true;
+}
+
+// Lee el estado de animacion de un personaje y lo deja listo para mandar.
+static void ReadMotion(uintptr_t em, MotPart* m)
+{
+	memset(m, 0, sizeof(*m));
+	m->tblIdx = -1;
+	if (em < 0x10000) return;
+	uint8_t mi[0xD0];
+	if (!SafeRead(em + EM_MOTION, mi, sizeof(mi))) return;
+	uint32_t fcv, herm, jno, jkind;
+	memcpy(&fcv, mi + 0, 4); memcpy(&herm, mi + 4, 4); memcpy(&jno, mi + 0x34, 4); memcpy(&jkind, mi + 0x38, 4);
+	if (fcv < 0x10000) return;
+	uint32_t t1 = 0, t2 = 0;
+	SafeRead(em + EM_MOTTBL1, &t1, 4);
+	SafeRead(em + EM_MOTTBL2, &t2, 4);
+	if (t1 < 0x10000) return;
+	m->dFcv = (int32_t)(fcv - t1);
+	m->dHerm = (int32_t)(herm - t1);
+	m->dJno = (int32_t)(jno - t1);
+	m->dJkind = (int32_t)(jkind - t1);
+	if (!HashAt(fcv, &m->hash)) return;
+	memcpy(&m->frameMax, mi + 0x20, 4);
+	memcpy(&m->frame, mi + 0x24, 4);
+	memcpy(&m->speed, mi + 0xC0, 4);
+	memcpy(&m->attr, mi + 0x40, 2);
+	memcpy(&m->state, mi + 0x42, 2);
+	memcpy(&m->flag, mi + 0x44, 4);
+	m->jointNum = mi[0x30];
+	// Buscar el clip en las tablas (para saber su indice).
+	static uint32_t tbl[512];
+	for (int sel = 0; sel < 2; sel++)
+	{
+		uint32_t t = sel == 0 ? t1 : t2;
+		if (t < 0x10000) continue;
+		if (!SafeRead(t, tbl, sizeof(tbl))) continue;
+		bool hit = false;
+		for (int i = 0; i < 512; i++)
+			if (tbl[i] == fcv) { m->tblIdx = (int16_t)i; m->tblSel = (uint8_t)sel; hit = true; break; }
+		if (hit) break;
+	}
+	m->valid = 1;
+}
+
+// Busca MotionMoveCore (pEm, pInfo): el patron de re4_tweaks cae dentro de la funcion; se retrocede hasta su inicio.
+static void FindMotionMove()
+{
+	uintptr_t hit = FindPattern("MotionMoveCore (dentro)", "8A 45 88 A8 02 0F 84 ? ? ? ? D9 85 70 FF FF FF DD 05 ? ? ? ? D8 C1 D9 85 74 FF FF FF DE D9 DF E0 F6 C4 05 7B ? 80 7D 90 00 74 ? 80 7D 8F 00 75");
+	if (!hit) return;
+	static uint8_t buf[0x1800];
+	uintptr_t start = hit - sizeof(buf) + 0x40;
+	if (!SafeRead(start, buf, sizeof(buf))) { Log("MOTION: no pude leer el codigo antes de MotionMoveCore"); return; }
+	size_t at = hit - start;
+	uintptr_t entry = 0;
+	for (size_t i = at; i > 8; i--)
+		if (buf[i] == 0x55 && buf[i + 1] == 0x8B && buf[i + 2] == 0xEC && (buf[i - 1] == 0xCC || buf[i - 1] == 0xC3 || buf[i - 1] == 0x90))
+		{ entry = start + i; break; }
+	if (!entry) { Log("MOTION: no encontre el inicio de MotionMoveCore"); return; }
+	uint32_t real = 0;
+	g_motMoveRet = AnalyzeRet((uint32_t)entry, &real);
+	g_motMoveFn = entry;
+	Log("MOTION: MotionMoveCore empieza en 0x%08X (a %d bytes del patron), ret=%d", (unsigned)entry, (int)(hit - entry), g_motMoveRet);
+	char hex[400];
+	HexDump(entry, 48, hex, sizeof(hex));
+	Log("MOTION: primeros bytes: %s", hex);
+
+	// Quien la llama: se anotan las instrucciones previas a cada llamada (para ver cuantos argumentos se empujan).
+	uint8_t* base = (uint8_t*)GetModuleHandleA(nullptr);
+	auto dos = (PIMAGE_DOS_HEADER)base;
+	auto nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+	auto sec = IMAGE_FIRST_SECTION(nt);
+	int found = 0;
+	for (unsigned k = 0; k < nt->FileHeader.NumberOfSections && found < 8; k++, sec++)
+	{
+		if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+		uint8_t* st = base + sec->VirtualAddress;
+		size_t sz = sec->Misc.VirtualSize;
+		for (size_t o = 24; o + 16 < sz && found < 8; o++)
+		{
+			if (st[o] != 0xE8) continue;
+			int32_t rel; memcpy(&rel, st + o + 1, 4);
+			if ((uintptr_t)(st + o + 5) + rel != entry) continue;
+			found++;
+			char h1[200], h2[100];
+			HexDump((uintptr_t)(st + o - 24), 24, h1, sizeof(h1));
+			HexDump((uintptr_t)(st + o), 12, h2, sizeof(h2));
+			Log("MOTION: llamada #%d en 0x%08X | antes: %s | desde la llamada: %s", found, (unsigned)(uintptr_t)(st + o), h1, h2);
+		}
+	}
+	if (!found) Log("MOTION: no se encontraron llamadas directas a MotionMoveCore");
+}
+
+// Llama a MotionMoveCore(em, info) sin importar si la funcion limpia la pila o no (se restaura esp a mano).
+static bool CallMotionMove(uintptr_t em, uintptr_t info)
+{
+	if (!g_motMoveFn) return false;
+	__try
+	{
+#if defined(_MSC_VER) && defined(_M_IX86)
+		DWORD fnV = (DWORD)g_motMoveFn, emV = (DWORD)em, infoV = (DWORD)info;
+		__asm {
+			mov esi, esp
+			push infoV
+			push emV
+			call fnV
+			mov esp, esi
+		}
+#endif
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+// Lado que recibe: escribe la animacion del otro jugador en el clon y evalua la pose.
+static int g_motClipChanges = 0, g_motViaIdx = 0, g_motNoTbl = 0;
+static int32_t g_motKey[4] = { 0, 0, 0, 0 };
+static bool g_motKeyValid = false;
+static bool g_motClipOk = false;
+static uint32_t g_motFcv = 0;
+static float g_motFrame = 0.0f;
+static uint32_t g_motLastStamp = 0;
+static bool g_motTablesLogged = false;
+
+static bool IsSaneFloat(float f, float lo, float hi) { return f == f && f >= lo && f <= hi; }
+
+static void MotionApply(const RemoteSnap& snap, float dt)
+{
+	if (!g_motApply || !g_ghost.em || !snap.mot.valid) return;
+	const MotPart& p = snap.mot;
+	if (!IsSaneFloat(p.frameMax, 1.0f, 5000.0f) || !IsSaneFloat(p.frame, -1.0f, 5000.0f)) return;
+	float speed = IsSaneFloat(p.speed, 0.0f, 4.0f) ? p.speed : 1.0f;
+	uintptr_t em = g_ghost.em;
+	uint32_t tbl = 0;
+	if (!SafeRead(em + EM_MOTTBL1, &tbl, 4) || tbl < 0x10000) { g_motNoTbl++; return; }
+
+	int32_t key[4] = { p.dFcv, p.dHerm, p.dJno, p.dJkind };
+	bool newClip = !g_motKeyValid || memcmp(key, g_motKey, sizeof(key)) != 0;
+	if (newClip)
+	{
+		memcpy(g_motKey, key, sizeof(key));
+		g_motKeyValid = true;
+		g_motClipChanges++;
+		g_motClipOk = false;
+		// 1) por distancia a la tabla; 2) por posicion en la tabla. En los dos casos se comprueba el hash del clip.
+		uint32_t cand[2] = { tbl + (uint32_t)p.dFcv, 0 };
+		if (p.tblIdx >= 0)
+		{
+			uint32_t tb = 0, e = 0;
+			if (SafeRead(em + (p.tblSel ? EM_MOTTBL2 : EM_MOTTBL1), &tb, 4) && tb > 0x10000 && SafeRead(tb + (uintptr_t)p.tblIdx * 4, &e, 4))
+				cand[1] = e;
+		}
+		for (int c = 0; c < 2 && !g_motClipOk; c++)
+		{
+			uint32_t h = 0;
+			if (!HashAt(cand[c], &h) || h != p.hash) continue;
+			g_motFcv = cand[c];
+			g_motClipOk = true;
+			if (c == 1) g_motViaIdx++;
+		}
+		if (!g_motClipOk)
+		{
+			g_motHashFail++;
+			if (g_motHashFail <= 12)
+				Log("MOTION: no pude encontrar el clip del otro jugador (dFcv=%d idx=%d sel=%d hash=%08X max=%.0f)", (int)p.dFcv, (int)p.tblIdx, (int)p.tblSel,
+					(unsigned)p.hash, p.frameMax);
+		}
+		else
+		{
+			uint32_t herm = g_motFcv + (uint32_t)(p.dHerm - p.dFcv);
+			uint32_t jno = g_motFcv + (uint32_t)(p.dJno - p.dFcv);
+			uint32_t jk = g_motFcv + (uint32_t)(p.dJkind - p.dFcv);
+			uint8_t zero[24];
+			memset(zero, 0, sizeof(zero));
+			SafeWrite(em + EM_MOTION + 0x00, &g_motFcv, 4);
+			SafeWrite(em + EM_MOTION + 0x04, &herm, 4);
+			SafeWrite(em + EM_MOTION + 0x08, zero, 24);
+			SafeWrite(em + EM_MOTION + 0x20, &p.frameMax, 4);
+			SafeWrite(em + EM_MOTION + 0x30, &p.jointNum, 1);
+			SafeWrite(em + EM_MOTION + 0x34, &jno, 4);
+			SafeWrite(em + EM_MOTION + 0x38, &jk, 4);
+			g_motFrame = p.frame;
+			g_motLastStamp = snap.motStamp;
+			if (g_motClipChanges <= 6)
+				Log("MOTION: clip nuevo aplicado al clon (fcv=0x%08X max=%.0f attr=0x%04X estado=0x%04X flag=0x%08X)", (unsigned)g_motFcv, p.frameMax,
+					(unsigned)p.attr, (unsigned)p.state, (unsigned)p.flag);
+		}
+	}
+	if (!g_motClipOk) { g_motNoClip++; return; }
+
+	// Frame: avanza solo entre paquetes y se corrige con cada paquete nuevo.
+	if (snap.motStamp != g_motLastStamp)
+	{
+		g_motLastStamp = snap.motStamp;
+		float diff = p.frame - g_motFrame;
+		if (fabsf(diff) > 6.0f) g_motFrame = p.frame; else g_motFrame += diff * 0.5f;
+	}
+	else
+		g_motFrame += dt * 30.0f * speed;
+	if (g_motFrame >= p.frameMax) g_motFrame = p.frameMax - 0.01f;
+	if (g_motFrame < 0.0f) g_motFrame = 0.0f;
+
+	float oldFrame = 0.0f;
+	SafeRead(em + EM_MOTION + 0x24, &oldFrame, 4);
+	SafeWrite(em + EM_MOTION + 0x20, &p.frameMax, 4);
+	SafeWrite(em + EM_MOTION + 0x24, &g_motFrame, 4);
+	SafeWrite(em + EM_MOTION + 0x28, &g_motFrame, 4);
+	SafeWrite(em + EM_MOTION + 0x2C, &oldFrame, 4);
+	SafeWrite(em + EM_MOTION + 0x40, &p.attr, 2);
+	SafeWrite(em + EM_MOTION + 0x42, &p.state, 2);
+	SafeWrite(em + EM_MOTION + 0x44, &p.flag, 4);
+	g_motApplied++;
+
+	if (g_motEval && g_motMoveFn)
+	{
+		g_riskId = g_ghost.id;
+		g_riskCode = 2;
+		g_riskStart = GetTickCount();
+		bool ok = CallMotionMove(em, em + EM_MOTION);
+		g_riskStart = 0;
+		if (ok) g_motEvalCalls++;
+		else
+		{
+			g_motEvalFail++;
+			g_motEval = false;
+			Log("MOTION: fallo la llamada a MotionMoveCore; se deja solo escribir los datos");
+		}
+	}
+}
+
+// Una linea por segundo (y un volcado de las tablas la primera vez) para entender como se identifican los clips.
+static void MotionLog()
+{
+	uintptr_t le = 0;
+	if (g_plGlobal) SafeRead(g_plGlobal, &le, 4);
+	if (le > 0x10000)
+	{
+		MotPart q;
+		ReadMotion(le, &q);
+		uint32_t t0 = 0, t1 = 0;
+		SafeRead(le + EM_MOTTBL1, &t0, 4);
+		SafeRead(le + EM_MOTTBL2, &t1, 4);
+		if (!g_motTablesLogged && t0 > 0x10000)
+		{
+			g_motTablesLogged = true;
+			uintptr_t ce = g_ghost.em;
+			uint32_t c0 = 0, c1 = 0;
+			if (ce) { SafeRead(ce + EM_MOTTBL1, &c0, 4); SafeRead(ce + EM_MOTTBL2, &c1, 4); }
+			Log("MOTION-TABLAS: Leon 46C=0x%08X 470=0x%08X | clon 46C=0x%08X 470=0x%08X", (unsigned)t0, (unsigned)t1, (unsigned)c0, (unsigned)c1);
+			for (int sel = 0; sel < 2; sel++)
+			{
+				uint32_t tb = sel ? t1 : t0;
+				if (tb < 0x10000) continue;
+				for (int row = 0; row < 6; row++)
+				{
+					uint32_t e[8];
+					if (!SafeRead(tb + row * 32, e, sizeof(e))) break;
+					Log("MOTION-TABLA%d[%02d..%02d]: %08X %08X %08X %08X %08X %08X %08X %08X", sel, row * 8, row * 8 + 7,
+						(unsigned)e[0], (unsigned)e[1], (unsigned)e[2], (unsigned)e[3], (unsigned)e[4], (unsigned)e[5], (unsigned)e[6], (unsigned)e[7]);
+				}
+			}
+		}
+		Log("MOTION-LEON: valido=%d dFcv=%d dHerm=%d dJno=%d dJkind=%d idx=%d/%d hash=%08X frame=%.1f/%.0f vel=%.2f attr=0x%04X estado=0x%04X flag=0x%08X juntas=%d",
+			(int)q.valid, (int)q.dFcv, (int)q.dHerm, (int)q.dJno, (int)q.dJkind, (int)q.tblIdx, (int)q.tblSel, (unsigned)q.hash,
+			q.frame, q.frameMax, q.speed, (unsigned)q.attr, (unsigned)q.state, (unsigned)q.flag, (int)q.jointNum);
+	}
+	RemoteSnap rs = GetRemoteSnap();
+	Log("MOTION-CLON: aplicar=%d evaluar=%d recibido=%d clipOk=%d aplicado=%d clipsNuevos=%d fallaHash=%d porIndice=%d evalOk=%d evalFalla=%d sinTabla=%d sinClip=%d frame=%.1f",
+		(int)g_motApply, (int)g_motEval, (int)rs.mot.valid, (int)g_motClipOk, g_motApplied, g_motClipChanges, g_motHashFail, g_motViaIdx, g_motEvalCalls,
+		g_motEvalFail, g_motNoTbl, g_motNoClip, g_motFrame);
+	if (g_ghost.em)
+	{
+		char hex[260];
+		HexDump(g_ghost.em + EM_MOTION, 0x48, hex, sizeof(hex));
+		Log("MOTION-CLON-INFO: %s", hex);
+	}
+}
+
 // ---------------------------------------------------------------- 3t: camara
 // La camara del juego (CameraControl) guarda a que modelo esta "pegada": m_p_model_10[3] (+0x10..+0x18) y m_p_attach_model_old_1C (+0x1C).
 // Hipotesis: al crearse, el clon (que es un jugador completo) pega la camara a si mismo. Aca la devolvemos a Leon.
@@ -1523,6 +1855,10 @@ static void GhostMove(const RemoteSnap& snap, float dt)
 		g_ghost.pos[2] += dz * alpha;
 		g_ghost.yaw += AngleDiff(snap.yaw, g_ghost.yaw) * alpha;
 	}
+
+	// 3w: animacion del otro jugador (antes de poner la posicion, porque la funcion de animacion puede mover un poco al personaje).
+	if (g_ghost.isClone && g_testSlot == 4)
+		MotionApply(snap, dt);
 
 	SafeWrite(g_ghost.em + EM_POS, g_ghost.pos, sizeof(g_ghost.pos));
 	SafeWrite(g_ghost.em + EM_ANG_Y, &g_ghost.yaw, sizeof(g_ghost.yaw));
@@ -1880,6 +2216,19 @@ static void HandleHotkeys()
 		Beep(g_autoFreezeMove ? 800 : 350, 120);
 	}
 	g_f4Prev = f4;
+	static bool s_f2Prev = false;
+	bool f2 = focused && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+	if (f2 && !s_f2Prev)
+	{
+		// 0 = sin animacion, 1 = solo escribir datos, 2 = escribir y evaluar la pose
+		int mode = !g_motApply ? 0 : (g_motEval ? 2 : 1);
+		mode = (mode + 1) % 3;
+		g_motApply = mode >= 1;
+		g_motEval = mode >= 2;
+		Log("F2: animacion del clon = modo %d (%s)", mode, mode == 0 ? "apagada" : (mode == 1 ? "solo escribir datos" : "escribir y evaluar la pose"));
+		Beep(400 + mode * 250, 120);
+	}
+	s_f2Prev = f2;
 	bool f3 = focused && (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
 	if (f3 && !g_f3Prev)
 	{
@@ -2263,7 +2612,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3v (v3t) iniciado");
+	Log("RE4 Coop - hito 3w (v4 animacion) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2279,6 +2628,7 @@ void ModMain()
 		g_asGlobal = FindGlobalPointer("Ashley (pAS)", "A8 02 74 16 8B 15", 6);
 		g_pGvar = FindGlobalPointer("Datos globales (pG)", "A1 ? ? ? ? B9 FF FF FF 7F 21 48 ? A1", 1);
 		g_camCtrl = FindGlobalPointer("Camara (CamCtrl)", "D9 EE B9 ? ? ? ? D9 9E A4 00 00 00 E8 ? ? ? ? D9 EE", 3);
+		FindMotionMove();
 		g_emMgr = FindGlobalPointer("Lista de personajes (EmMgr)", "81 E1 01 02 00 00 83 F9 01 75 ? 50 B9 ? ? ? ? E8", 0xD);
 	}
 
@@ -2436,6 +2786,7 @@ void ModMain()
 			{
 				memcpy(p.pos, leon.pos, sizeof(p.pos));
 				p.yaw = leon.angY;
+				ReadMotion(leon.obj, &p.mot);
 			}
 			NetSend(p);
 			NetReceive();
@@ -2451,6 +2802,7 @@ void ModMain()
 		{
 			CamLog("periodico");
 			CamDiag();
+			MotionLog();
 		}
 		leonOk = ReadPlayer(g_plGlobal, &leon);
 		if (leonOk)

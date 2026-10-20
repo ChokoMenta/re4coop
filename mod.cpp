@@ -1243,10 +1243,14 @@ static void ReadMotion(uintptr_t em, MotPart* m)
 	SafeRead(em + EM_MOTTBL1, &t1, 4);
 	SafeRead(em + EM_MOTTBL2, &t2, 4);
 	if (t1 < 0x10000) return;
-	m->dFcv = (int32_t)(fcv - t1);
-	m->dHerm = (int32_t)(herm - t1);
-	m->dJno = (int32_t)(jno - t1);
-	m->dJkind = (int32_t)(jkind - t1);
+	// Referencia: el primer clip de la tabla (la pose quieta). Los clips estan todos en un mismo bloque que se carga igual en cada PC,
+	// en cambio la tabla en si esta en otro lugar de la memoria en cada PC (por eso antes no coincidian).
+	uint32_t anchor = 0;
+	if (!SafeRead(t1, &anchor, 4) || anchor < 0x10000) return;
+	m->dFcv = (int32_t)(fcv - anchor);
+	m->dHerm = (int32_t)(herm - anchor);
+	m->dJno = (int32_t)(jno - anchor);
+	m->dJkind = (int32_t)(jkind - anchor);
 	if (!HashAt(fcv, &m->hash)) return;
 	memcpy(&m->frameMax, mi + 0x20, 4);
 	memcpy(&m->frame, mi + 0x24, 4);
@@ -1319,6 +1323,18 @@ static void FindMotionMove()
 }
 
 // Llama a MotionMoveCore(em, info) sin importar si la funcion limpia la pila o no (se restaura esp a mano).
+static DWORD g_motExCode = 0;
+static uintptr_t g_motExAddr = 0;
+static int MotFilter(EXCEPTION_POINTERS* ep)
+{
+	if (ep && ep->ExceptionRecord)
+	{
+		g_motExCode = ep->ExceptionRecord->ExceptionCode;
+		g_motExAddr = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+	}
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static bool CallMotionMove(uintptr_t em, uintptr_t info)
 {
 	if (!g_motMoveFn) return false;
@@ -1336,7 +1352,7 @@ static bool CallMotionMove(uintptr_t em, uintptr_t info)
 #endif
 		return true;
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+	__except (MotFilter(GetExceptionInformation()))
 	{
 		return false;
 	}
@@ -1363,6 +1379,13 @@ static void MotionApply(const RemoteSnap& snap, float dt)
 	uintptr_t em = g_ghost.em;
 	uint32_t tbl = 0;
 	if (!SafeRead(em + EM_MOTTBL1, &tbl, 4) || tbl < 0x10000) { g_motNoTbl++; return; }
+	uint32_t anchor = 0;
+	{
+		uint32_t t = 0;
+		if (g_realLeon > 0x10000 && SafeRead(g_realLeon + EM_MOTTBL1, &t, 4) && t > 0x10000) SafeRead(t, &anchor, 4);
+		if (anchor < 0x10000) SafeRead(tbl, &anchor, 4);
+		if (anchor < 0x10000) { g_motNoTbl++; return; }
+	}
 
 	int32_t key[4] = { p.dFcv, p.dHerm, p.dJno, p.dJkind };
 	bool newClip = !g_motKeyValid || memcmp(key, g_motKey, sizeof(key)) != 0;
@@ -1373,7 +1396,7 @@ static void MotionApply(const RemoteSnap& snap, float dt)
 		g_motClipChanges++;
 		g_motClipOk = false;
 		// 1) por distancia a la tabla; 2) por posicion en la tabla. En los dos casos se comprueba el hash del clip.
-		uint32_t cand[2] = { tbl + (uint32_t)p.dFcv, 0 };
+		uint32_t cand[2] = { anchor + (uint32_t)p.dFcv, 0 };
 		if (p.tblIdx >= 0)
 		{
 			uint32_t tb = 0, e = 0;
@@ -1452,8 +1475,14 @@ static void MotionApply(const RemoteSnap& snap, float dt)
 		else
 		{
 			g_motEvalFail++;
-			g_motEval = false;
-			Log("MOTION: fallo la llamada a MotionMoveCore; se deja solo escribir los datos");
+			if (g_motEvalFail <= 6)
+				Log("MOTION: fallo la llamada a MotionMoveCore (codigo 0x%08X en 0x%08X, clip fcv=0x%08X max=%.0f attr=0x%04X)", (unsigned)g_motExCode,
+					(unsigned)g_motExAddr, (unsigned)g_motFcv, p.frameMax, (unsigned)p.attr);
+			if (g_motEvalFail >= 40)
+			{
+				g_motEval = false;
+				Log("MOTION: demasiadas fallas, se deja solo escribir los datos");
+			}
 		}
 	}
 }
@@ -2612,7 +2641,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3w (v4 animacion) iniciado");
+	Log("RE4 Coop - hito 3x (v4 animacion, ancla corregida) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 

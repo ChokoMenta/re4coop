@@ -434,13 +434,14 @@ struct NetPacket
 	uint32_t tickSend;  // mi reloj (GetTickCount) al enviar este paquete
 	uint32_t echoTick;  // el tickSend del ultimo paquete que recibi del otro (0 = ninguno todavia)
 	MotPart mot;
+	MotPart sub;      // 3y: segunda capa de animacion (cPlayer+0x474: parte de arriba del cuerpo al apuntar, etc.)
 };
 #pragma pack(pop)
 static_assert(sizeof(MotPart) == 48, "tamano inesperado de MotPart");
-static_assert(sizeof(NetPacket) == 88, "tamano inesperado del paquete");
+static_assert(sizeof(NetPacket) == 136, "tamano inesperado del paquete");
 
 static const uint32_t NET_MAGIC = 0x43344552u;
-static const uint16_t NET_VERSION = 4; // 4 = incluye la animacion de Leon (3 = ping)
+static const uint16_t NET_VERSION = 5; // 4 = incluye la animacion de Leon (3 = ping)
 static const uint16_t FLAG_IN_GAME = 1;
 
 #ifndef SIO_UDP_CONNRESET
@@ -470,6 +471,7 @@ struct RemoteState
 	DWORD firstConnectTick;   // cuando se conecto por primera vez en esta sesion de red
 	char peerText[48];        // direccion del otro jugador, para mostrar
 	MotPart mot;              // 3w: animacion del otro
+	MotPart sub;              // 3y: segunda capa
 	uint32_t motStamp;        // sube con cada paquete recibido
 };
 static RemoteState g_remote;
@@ -615,6 +617,7 @@ static void NetReceive()
 		g_remote.yaw = p.yaw;
 		g_remote.room = p.room;
 		g_remote.mot = p.mot;
+		g_remote.sub = p.sub;
 		g_remote.motStamp++;
 		g_remote.packetsThisSecond++;
 		{
@@ -665,6 +668,7 @@ struct RemoteSnap
 	float yaw;
 	uint16_t room;
 	MotPart mot;
+	MotPart sub;
 	uint32_t motStamp;
 };
 
@@ -681,6 +685,7 @@ static RemoteSnap GetRemoteSnap()
 		s.yaw = g_remote.yaw;
 		s.room = g_remote.room;
 		s.mot = g_remote.mot;
+		s.sub = g_remote.sub;
 		s.motStamp = g_remote.motStamp;
 	}
 	LeaveCriticalSection(&g_remoteLock);
@@ -1206,12 +1211,14 @@ static void SetupCloneVtable(uintptr_t em)
 static const uintptr_t EM_MOTION = 0x1D8;
 static const uintptr_t EM_MOTTBL1 = 0x46C;
 static const uintptr_t EM_MOTTBL2 = 0x470;
+static const uintptr_t EM_SUBMOT = 0x474;   // cPlayer::m_SubMot_474 (segunda capa)
+static bool g_motSub = true;                // segunda capa de animacion (siempre activa por ahora)
 
 static uintptr_t g_motMoveFn = 0;    // MotionMoveCore(pEm, pInfo): evalua el clip y pone la pose de los huesos
 static int g_motMoveRet = -1;        // bytes de argumentos que limpia la funcion (-1 = no se pudo saber)
 static bool g_motEval = true;        // F2 (modo 2): llamar a la funcion que evalua la animacion
 static bool g_motApply = true;       // F2 (modo 1): aplicar la animacion recibida al clon
-static int g_motApplied = 0, g_motHashFail = 0, g_motEvalCalls = 0, g_motEvalFail = 0, g_motNoClip = 0;
+static int g_motApplied = 0;
 
 static uint32_t Fnv32(const uint8_t* p, int n)
 {
@@ -1229,13 +1236,13 @@ static bool HashAt(uintptr_t a, uint32_t* out)
 }
 
 // Lee el estado de animacion de un personaje y lo deja listo para mandar.
-static void ReadMotion(uintptr_t em, MotPart* m)
+static void ReadMotionAt(uintptr_t em, uintptr_t infoOff, MotPart* m)
 {
 	memset(m, 0, sizeof(*m));
 	m->tblIdx = -1;
 	if (em < 0x10000) return;
 	uint8_t mi[0xD0];
-	if (!SafeRead(em + EM_MOTION, mi, sizeof(mi))) return;
+	if (!SafeRead(em + infoOff, mi, sizeof(mi))) return;
 	uint32_t fcv, herm, jno, jkind;
 	memcpy(&fcv, mi + 0, 4); memcpy(&herm, mi + 4, 4); memcpy(&jno, mi + 0x34, 4); memcpy(&jkind, mi + 0x38, 4);
 	if (fcv < 0x10000) return;
@@ -1273,6 +1280,8 @@ static void ReadMotion(uintptr_t em, MotPart* m)
 	}
 	m->valid = 1;
 }
+
+static void ReadMotion(uintptr_t em, MotPart* m) { ReadMotionAt(em, EM_MOTION, m); }
 
 // Busca MotionMoveCore (pEm, pInfo): el patron de re4_tweaks cae dentro de la funcion; se retrocede hasta su inicio.
 static void FindMotionMove()
@@ -1325,12 +1334,22 @@ static void FindMotionMove()
 // Llama a MotionMoveCore(em, info) sin importar si la funcion limpia la pila o no (se restaura esp a mano).
 static DWORD g_motExCode = 0;
 static uintptr_t g_motExAddr = 0;
+static uintptr_t g_motExInfo0 = 0, g_motExInfo1 = 0;
+static DWORD g_motExRegs[7] = { 0, 0, 0, 0, 0, 0, 0 };
 static int MotFilter(EXCEPTION_POINTERS* ep)
 {
 	if (ep && ep->ExceptionRecord)
 	{
 		g_motExCode = ep->ExceptionRecord->ExceptionCode;
 		g_motExAddr = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+		g_motExInfo0 = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[0];
+		g_motExInfo1 = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+	}
+	if (ep && ep->ContextRecord)
+	{
+		g_motExRegs[0] = ep->ContextRecord->Eax; g_motExRegs[1] = ep->ContextRecord->Ebx; g_motExRegs[2] = ep->ContextRecord->Ecx;
+		g_motExRegs[3] = ep->ContextRecord->Edx; g_motExRegs[4] = ep->ContextRecord->Esi; g_motExRegs[5] = ep->ContextRecord->Edi;
+		g_motExRegs[6] = ep->ContextRecord->Ebp;
 	}
 	return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -1358,133 +1377,157 @@ static bool CallMotionMove(uintptr_t em, uintptr_t info)
 	}
 }
 
-// Lado que recibe: escribe la animacion del otro jugador en el clon y evalua la pose.
-static int g_motClipChanges = 0, g_motViaIdx = 0, g_motNoTbl = 0;
-static int32_t g_motKey[4] = { 0, 0, 0, 0 };
-static bool g_motKeyValid = false;
-static bool g_motClipOk = false;
-static uint32_t g_motFcv = 0;
-static float g_motFrame = 0.0f;
-static uint32_t g_motLastStamp = 0;
+// Lado que recibe: escribe la animacion del otro jugador en el clon y evalua la pose. Dos capas: 0 = principal, 1 = secundaria.
+struct MotLayer
+{
+	int32_t key[4];
+	bool keyValid;
+	bool clipOk;
+	uint32_t fcv;
+	float frame;
+	uint32_t lastStamp;
+	int clipChanges, hashFail, evalOk, evalFail, skipped;
+};
+static MotLayer g_motL[2];
+static int g_motViaIdx = 0, g_motNoTbl = 0;
 static bool g_motTablesLogged = false;
+static uint32_t g_motBad[2][24];
+static int g_motBadN[2] = { 0, 0 };
 
 static bool IsSaneFloat(float f, float lo, float hi) { return f == f && f >= lo && f <= hi; }
 
-static void MotionApply(const RemoteSnap& snap, float dt)
+static bool MotIsBad(int layer, uint32_t fcv)
 {
-	if (!g_motApply || !g_ghost.em || !snap.mot.valid) return;
-	const MotPart& p = snap.mot;
+	for (int i = 0; i < g_motBadN[layer]; i++) if (g_motBad[layer][i] == fcv) return true;
+	return false;
+}
+
+static void MotionApplyLayer(int layer, uintptr_t em, uintptr_t infoOff, const MotPart& p, uint32_t stamp, uint32_t anchor, float dt)
+{
+	MotLayer& L = g_motL[layer];
+	if (!p.valid) return;
 	if (!IsSaneFloat(p.frameMax, 1.0f, 5000.0f) || !IsSaneFloat(p.frame, -1.0f, 5000.0f)) return;
 	float speed = IsSaneFloat(p.speed, 0.0f, 4.0f) ? p.speed : 1.0f;
-	uintptr_t em = g_ghost.em;
-	uint32_t tbl = 0;
-	if (!SafeRead(em + EM_MOTTBL1, &tbl, 4) || tbl < 0x10000) { g_motNoTbl++; return; }
-	uint32_t anchor = 0;
-	{
-		uint32_t t = 0;
-		if (g_realLeon > 0x10000 && SafeRead(g_realLeon + EM_MOTTBL1, &t, 4) && t > 0x10000) SafeRead(t, &anchor, 4);
-		if (anchor < 0x10000) SafeRead(tbl, &anchor, 4);
-		if (anchor < 0x10000) { g_motNoTbl++; return; }
-	}
+	uintptr_t info = em + infoOff;
 
 	int32_t key[4] = { p.dFcv, p.dHerm, p.dJno, p.dJkind };
-	bool newClip = !g_motKeyValid || memcmp(key, g_motKey, sizeof(key)) != 0;
+	bool newClip = !L.keyValid || memcmp(key, L.key, sizeof(key)) != 0;
 	if (newClip)
 	{
-		memcpy(g_motKey, key, sizeof(key));
-		g_motKeyValid = true;
-		g_motClipChanges++;
-		g_motClipOk = false;
-		// 1) por distancia a la tabla; 2) por posicion en la tabla. En los dos casos se comprueba el hash del clip.
+		memcpy(L.key, key, sizeof(key));
+		L.keyValid = true;
+		L.clipChanges++;
+		L.clipOk = false;
 		uint32_t cand[2] = { anchor + (uint32_t)p.dFcv, 0 };
-		if (p.tblIdx >= 0)
+		if (layer == 0 && p.tblIdx >= 0)
 		{
 			uint32_t tb = 0, e = 0;
 			if (SafeRead(em + (p.tblSel ? EM_MOTTBL2 : EM_MOTTBL1), &tb, 4) && tb > 0x10000 && SafeRead(tb + (uintptr_t)p.tblIdx * 4, &e, 4))
 				cand[1] = e;
 		}
-		for (int c = 0; c < 2 && !g_motClipOk; c++)
+		for (int c = 0; c < 2 && !L.clipOk; c++)
 		{
 			uint32_t h = 0;
 			if (!HashAt(cand[c], &h) || h != p.hash) continue;
-			g_motFcv = cand[c];
-			g_motClipOk = true;
+			L.fcv = cand[c];
+			L.clipOk = true;
 			if (c == 1) g_motViaIdx++;
 		}
-		if (!g_motClipOk)
+		if (!L.clipOk)
 		{
-			g_motHashFail++;
-			if (g_motHashFail <= 12)
-				Log("MOTION: no pude encontrar el clip del otro jugador (dFcv=%d idx=%d sel=%d hash=%08X max=%.0f)", (int)p.dFcv, (int)p.tblIdx, (int)p.tblSel,
+			L.hashFail++;
+			if (L.hashFail <= 8)
+				Log("MOTION[%d]: no pude encontrar el clip del otro jugador (dFcv=%d idx=%d hash=%08X max=%.0f)", layer, (int)p.dFcv, (int)p.tblIdx,
 					(unsigned)p.hash, p.frameMax);
 		}
 		else
 		{
-			uint32_t herm = g_motFcv + (uint32_t)(p.dHerm - p.dFcv);
-			uint32_t jno = g_motFcv + (uint32_t)(p.dJno - p.dFcv);
-			uint32_t jk = g_motFcv + (uint32_t)(p.dJkind - p.dFcv);
+			uint32_t herm = L.fcv + (uint32_t)(p.dHerm - p.dFcv);
+			uint32_t jno = L.fcv + (uint32_t)(p.dJno - p.dFcv);
+			uint32_t jk = L.fcv + (uint32_t)(p.dJkind - p.dFcv);
 			uint8_t zero[24];
 			memset(zero, 0, sizeof(zero));
-			SafeWrite(em + EM_MOTION + 0x00, &g_motFcv, 4);
-			SafeWrite(em + EM_MOTION + 0x04, &herm, 4);
-			SafeWrite(em + EM_MOTION + 0x08, zero, 24);
-			SafeWrite(em + EM_MOTION + 0x20, &p.frameMax, 4);
-			SafeWrite(em + EM_MOTION + 0x30, &p.jointNum, 1);
-			SafeWrite(em + EM_MOTION + 0x34, &jno, 4);
-			SafeWrite(em + EM_MOTION + 0x38, &jk, 4);
-			g_motFrame = p.frame;
-			g_motLastStamp = snap.motStamp;
-			if (g_motClipChanges <= 6)
-				Log("MOTION: clip nuevo aplicado al clon (fcv=0x%08X max=%.0f attr=0x%04X estado=0x%04X flag=0x%08X)", (unsigned)g_motFcv, p.frameMax,
-					(unsigned)p.attr, (unsigned)p.state, (unsigned)p.flag);
+			SafeWrite(info + 0x00, &L.fcv, 4);
+			SafeWrite(info + 0x04, &herm, 4);
+			SafeWrite(info + 0x08, zero, 24);
+			SafeWrite(info + 0x20, &p.frameMax, 4);
+			SafeWrite(info + 0x30, &p.jointNum, 1);
+			SafeWrite(info + 0x34, &jno, 4);
+			SafeWrite(info + 0x38, &jk, 4);
+			L.frame = p.frame;
+			L.lastStamp = stamp;
+			if (L.clipChanges <= 6)
+				Log("MOTION[%d]: clip nuevo aplicado (fcv=0x%08X max=%.0f juntas=%d attr=0x%04X estado=0x%04X flag=0x%08X)", layer, (unsigned)L.fcv, p.frameMax,
+					(int)p.jointNum, (unsigned)p.attr, (unsigned)p.state, (unsigned)p.flag);
 		}
 	}
-	if (!g_motClipOk) { g_motNoClip++; return; }
+	if (!L.clipOk) return;
 
-	// Frame: avanza solo entre paquetes y se corrige con cada paquete nuevo.
-	if (snap.motStamp != g_motLastStamp)
+	if (stamp != L.lastStamp)
 	{
-		g_motLastStamp = snap.motStamp;
-		float diff = p.frame - g_motFrame;
-		if (fabsf(diff) > 6.0f) g_motFrame = p.frame; else g_motFrame += diff * 0.5f;
+		L.lastStamp = stamp;
+		float diff = p.frame - L.frame;
+		if (fabsf(diff) > 6.0f) L.frame = p.frame; else L.frame += diff * 0.5f;
 	}
 	else
-		g_motFrame += dt * 30.0f * speed;
-	if (g_motFrame >= p.frameMax) g_motFrame = p.frameMax - 0.01f;
-	if (g_motFrame < 0.0f) g_motFrame = 0.0f;
+		L.frame += dt * 30.0f * speed;
+	if (L.frame >= p.frameMax) L.frame = p.frameMax - 0.01f;
+	if (L.frame < 0.0f) L.frame = 0.0f;
 
 	float oldFrame = 0.0f;
-	SafeRead(em + EM_MOTION + 0x24, &oldFrame, 4);
-	SafeWrite(em + EM_MOTION + 0x20, &p.frameMax, 4);
-	SafeWrite(em + EM_MOTION + 0x24, &g_motFrame, 4);
-	SafeWrite(em + EM_MOTION + 0x28, &g_motFrame, 4);
-	SafeWrite(em + EM_MOTION + 0x2C, &oldFrame, 4);
-	SafeWrite(em + EM_MOTION + 0x40, &p.attr, 2);
-	SafeWrite(em + EM_MOTION + 0x42, &p.state, 2);
-	SafeWrite(em + EM_MOTION + 0x44, &p.flag, 4);
+	SafeRead(info + 0x24, &oldFrame, 4);
+	SafeWrite(info + 0x20, &p.frameMax, 4);
+	SafeWrite(info + 0x24, &L.frame, 4);
+	SafeWrite(info + 0x28, &L.frame, 4);
+	SafeWrite(info + 0x2C, &oldFrame, 4);
+	SafeWrite(info + 0x40, &p.attr, 2);
+	SafeWrite(info + 0x42, &p.state, 2);
+	SafeWrite(info + 0x44, &p.flag, 4);
 	g_motApplied++;
 
 	if (g_motEval && g_motMoveFn)
 	{
+		if (MotIsBad(layer, L.fcv)) { L.skipped++; return; }
 		g_riskId = g_ghost.id;
 		g_riskCode = 2;
 		g_riskStart = GetTickCount();
-		bool ok = CallMotionMove(em, em + EM_MOTION);
+		bool ok = CallMotionMove(em, info);
 		g_riskStart = 0;
-		if (ok) g_motEvalCalls++;
+		if (ok) L.evalOk++;
 		else
 		{
-			g_motEvalFail++;
-			if (g_motEvalFail <= 6)
-				Log("MOTION: fallo la llamada a MotionMoveCore (codigo 0x%08X en 0x%08X, clip fcv=0x%08X max=%.0f attr=0x%04X)", (unsigned)g_motExCode,
-					(unsigned)g_motExAddr, (unsigned)g_motFcv, p.frameMax, (unsigned)p.attr);
-			if (g_motEvalFail >= 40)
+			L.evalFail++;
+			if (g_motBadN[layer] < 24) g_motBad[layer][g_motBadN[layer]++] = L.fcv; // ese clip no se vuelve a evaluar
+			if (L.evalFail <= 4)
 			{
-				g_motEval = false;
-				Log("MOTION: demasiadas fallas, se deja solo escribir los datos");
+				char before[200], after[100];
+				HexDump(g_motExAddr - 24, 24, before, sizeof(before));
+				HexDump(g_motExAddr, 12, after, sizeof(after));
+				Log("MOTION[%d]: FALLO MotionMoveCore codigo 0x%08X en 0x%08X (%s direccion 0x%08X) clip fcv=0x%08X max=%.0f juntas=%d attr=0x%04X",
+					layer, (unsigned)g_motExCode, (unsigned)g_motExAddr, g_motExInfo0 == 1 ? "escribiendo" : "leyendo", (unsigned)g_motExInfo1,
+					(unsigned)L.fcv, p.frameMax, (int)p.jointNum, (unsigned)p.attr);
+				Log("MOTION[%d]: regs eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X | em=0x%08X info=0x%08X", layer,
+					(unsigned)g_motExRegs[0], (unsigned)g_motExRegs[1], (unsigned)g_motExRegs[2], (unsigned)g_motExRegs[3], (unsigned)g_motExRegs[4],
+					(unsigned)g_motExRegs[5], (unsigned)g_motExRegs[6], (unsigned)em, (unsigned)info);
+				Log("MOTION[%d]: codigo antes: %s| desde la falla: %s", layer, before, after);
 			}
 		}
 	}
+}
+
+static void MotionApply(const RemoteSnap& snap, float dt)
+{
+	if (!g_motApply || !g_ghost.em || !snap.mot.valid) return;
+	uintptr_t em = g_ghost.em;
+	uint32_t anchor = 0;
+	{
+		uint32_t t = 0;
+		if (g_realLeon > 0x10000 && SafeRead(g_realLeon + EM_MOTTBL1, &t, 4) && t > 0x10000) SafeRead(t, &anchor, 4);
+		if (anchor < 0x10000 && SafeRead(em + EM_MOTTBL1, &t, 4) && t > 0x10000) SafeRead(t, &anchor, 4);
+		if (anchor < 0x10000) { g_motNoTbl++; return; }
+	}
+	MotionApplyLayer(0, em, EM_MOTION, snap.mot, snap.motStamp, anchor, dt);
+	if (g_motSub) MotionApplyLayer(1, em, EM_SUBMOT, snap.sub, snap.motStamp, anchor, dt);
 }
 
 // Una linea por segundo (y un volcado de las tablas la primera vez) para entender como se identifican los clips.
@@ -1524,9 +1567,24 @@ static void MotionLog()
 			q.frame, q.frameMax, q.speed, (unsigned)q.attr, (unsigned)q.state, (unsigned)q.flag, (int)q.jointNum);
 	}
 	RemoteSnap rs = GetRemoteSnap();
-	Log("MOTION-CLON: aplicar=%d evaluar=%d recibido=%d clipOk=%d aplicado=%d clipsNuevos=%d fallaHash=%d porIndice=%d evalOk=%d evalFalla=%d sinTabla=%d sinClip=%d frame=%.1f",
-		(int)g_motApply, (int)g_motEval, (int)rs.mot.valid, (int)g_motClipOk, g_motApplied, g_motClipChanges, g_motHashFail, g_motViaIdx, g_motEvalCalls,
-		g_motEvalFail, g_motNoTbl, g_motNoClip, g_motFrame);
+	for (int ly = 0; ly < 2; ly++)
+	{
+		const MotLayer& L = g_motL[ly];
+		Log("MOTION-CLON[%d]: aplicar=%d evaluar=%d recibido=%d clipOk=%d aplicado=%d clipsNuevos=%d fallaHash=%d porIndice=%d evalOk=%d evalFalla=%d omitidos=%d malos=%d frame=%.1f",
+			ly, (int)g_motApply, (int)g_motEval, (int)(ly ? rs.sub.valid : rs.mot.valid), (int)L.clipOk, g_motApplied, L.clipChanges, L.hashFail, g_motViaIdx,
+			L.evalOk, L.evalFail, L.skipped, g_motBadN[ly], L.frame);
+	}
+	if (le > 0x10000)
+	{
+		MotPart q2;
+		ReadMotionAt(le, EM_SUBMOT, &q2);
+		uint32_t pb[3] = { 0, 0, 0 }, cb[3] = { 0, 0, 0 };
+		SafeRead(le + 0x2A8, &pb[0], 4); SafeRead(le + 0x2AC, &pb[1], 4); SafeRead(le + 0x2B0, &pb[2], 4);
+		if (g_ghost.em) { SafeRead(g_ghost.em + 0x2A8, &cb[0], 4); SafeRead(g_ghost.em + 0x2AC, &cb[1], 4); SafeRead(g_ghost.em + 0x2B0, &cb[2], 4); }
+		Log("MOTION-CAPA2-LEON: valido=%d dFcv=%d hash=%08X frame=%.1f/%.0f attr=0x%04X estado=0x%04X flag=0x%08X juntas=%d | pMotionB=0x%08X (Leon+0x474=0x%08X) xflip=0x%08X dbljnt=0x%08X | clon pMotionB=0x%08X (clon+0x474=0x%08X)",
+			(int)q2.valid, (int)q2.dFcv, (unsigned)q2.hash, q2.frame, q2.frameMax, (unsigned)q2.attr, (unsigned)q2.state, (unsigned)q2.flag, (int)q2.jointNum,
+			(unsigned)pb[0], (unsigned)(le + EM_SUBMOT), (unsigned)pb[1], (unsigned)pb[2], (unsigned)cb[0], (unsigned)(g_ghost.em + EM_SUBMOT));
+	}
 	if (g_ghost.em)
 	{
 		char hex[260];
@@ -2641,7 +2699,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3x (v4 animacion, ancla corregida) iniciado");
+	Log("RE4 Coop - hito 3y (v5 dos capas de animacion) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
@@ -2816,6 +2874,7 @@ void ModMain()
 				memcpy(p.pos, leon.pos, sizeof(p.pos));
 				p.yaw = leon.angY;
 				ReadMotion(leon.obj, &p.mot);
+				ReadMotionAt(leon.obj, EM_SUBMOT, &p.sub);
 			}
 			NetSend(p);
 			NetReceive();

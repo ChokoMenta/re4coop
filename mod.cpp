@@ -1212,6 +1212,7 @@ static const uintptr_t EM_MOTION = 0x1D8;
 static const uintptr_t EM_MOTTBL1 = 0x46C;
 static const uintptr_t EM_MOTTBL2 = 0x470;
 static const uintptr_t EM_SUBMOT = 0x474;   // cPlayer::m_SubMot_474 (segunda capa)
+static bool g_motSubEval = true;           // F2 modo 3 = evaluar solo la capa principal
 static bool g_motSub = true;                // segunda capa de animacion (siempre activa por ahora)
 
 static uintptr_t g_motMoveFn = 0;    // MotionMoveCore(pEm, pInfo): evalua el clip y pone la pose de los huesos
@@ -1560,7 +1561,7 @@ static void MotionApplyLayer(int layer, uintptr_t em, uintptr_t infoOff, const M
 	SafeWrite(info + 0x44, &p.flag, 4);
 	g_motApplied++;
 
-	if (g_motEval && g_motMoveFn)
+	if (g_motEval && g_motMoveFn && (layer == 0 || g_motSubEval))
 	{
 		if (MotIsBad(layer, L.fcv)) { L.skipped++; return; }
 		g_riskId = g_ghost.id;
@@ -1609,6 +1610,38 @@ static void MotionApply(const RemoteSnap& snap, float dt)
 		uint32_t pmb = (snap.sub.valid && snap.sub.pad[0] && g_motL[1].clipOk) ? (uint32_t)(em + EM_SUBMOT) : 0;
 		SafeWrite(em + 0x2A8, &pmb, 4);
 	}
+}
+
+// 3z2: posicion de cada parte del cuerpo (mundo relativa a la raiz | posicion local | escala) para ver si faltan piernas, etc.
+static void PartsLog(const char* tag, uintptr_t em)
+{
+	if (em < 0x10000) return;
+	float root[3] = { 0, 0, 0 };
+	SafeRead(em + 0x94, root, 12);
+	uint32_t p = 0;
+	SafeRead(em + 0xF4, &p, 4);
+	char line[500];
+	line[0] = 0;
+	size_t used = 0;
+	int n = 0, idx = 0;
+	while (p > 0x10000 && idx < 40)
+	{
+		float w[3] = { 0, 0, 0 }, loc[3] = { 0, 0, 0 }, sc[3] = { 0, 0, 0 };
+		SafeRead(p + 0x18, &w[0], 4);
+		SafeRead(p + 0x28, &w[1], 4);
+		SafeRead(p + 0x38, &w[2], 4);
+		SafeRead(p + 0x94, loc, 12);
+		SafeRead(p + 0xAC, sc, 12);
+		used += snprintf(line + used, sizeof(line) - used, "%d:(%.0f,%.0f,%.0f|%.0f,%.0f,%.0f|%.2f) ", idx, w[0] - root[0], w[1] - root[1], w[2] - root[2],
+			loc[0], loc[1], loc[2], sc[0]);
+		if (++n == 5) { Log("%s %s", tag, line); line[0] = 0; used = 0; n = 0; }
+		uint32_t nx = 0;
+		if (!SafeRead(p + 0xF4, &nx, 4)) break;
+		p = nx;
+		idx++;
+	}
+	if (n) Log("%s %s", tag, line);
+	Log("%s total de partes: %d", tag, idx);
 }
 
 // Una linea por segundo (y un volcado de las tablas la primera vez) para entender como se identifican los clips.
@@ -1665,6 +1698,14 @@ static void MotionLog()
 		Log("MOTION-CAPA2-LEON: valido=%d dFcv=%d hash=%08X frame=%.1f/%.0f attr=0x%04X estado=0x%04X flag=0x%08X juntas=%d | pMotionB=0x%08X (Leon+0x474=0x%08X) xflip=0x%08X dbljnt=0x%08X | clon pMotionB=0x%08X (clon+0x474=0x%08X)",
 			(int)q2.valid, (int)q2.dFcv, (unsigned)q2.hash, q2.frame, q2.frameMax, (unsigned)q2.attr, (unsigned)q2.state, (unsigned)q2.flag, (int)q2.jointNum,
 			(unsigned)pb[0], (unsigned)(le + EM_SUBMOT), (unsigned)pb[1], (unsigned)pb[2], (unsigned)cb[0], (unsigned)(g_ghost.em + EM_SUBMOT));
+	}
+	{
+		static int s_partsCount = 0;
+		if (g_ghost.em && (s_partsCount++ % 6) == 2)
+		{
+			if (le > 0x10000) PartsLog("PARTES-LEON", le);
+			PartsLog("PARTES-CLON", g_ghost.em);
+		}
 	}
 	if (g_ghost.em)
 	{
@@ -2374,7 +2415,7 @@ static void HandleHotkeys()
 	if (f7 && !g_f7Prev)
 		TogglePanel();
 	g_f7Prev = f7;
-	bool f4 = focused && (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+	bool f4 = focused && (GetAsyncKeyState(VK_F4) & 0x8000) != 0 && !(GetAsyncKeyState(VK_MENU) & 0x8000); // Alt+F4 cierra el juego: no se toma como tecla del mod
 	if (f4 && !g_f4Prev)
 	{
 		g_autoFreezeMove = !g_autoFreezeMove;
@@ -2388,13 +2429,14 @@ static void HandleHotkeys()
 	bool f2 = focused && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
 	if (f2 && !s_f2Prev)
 	{
-		// 0 = sin animacion, 1 = solo escribir datos, 2 = escribir y evaluar la pose
-		int mode = !g_motApply ? 0 : (g_motEval ? 2 : 1);
-		mode = (mode + 1) % 3;
+		// 0 = sin animacion, 1 = solo escribir datos, 2 = evaluar las dos capas, 3 = evaluar solo la capa principal
+		int mode = !g_motApply ? 0 : (!g_motEval ? 1 : (g_motSubEval ? 2 : 3));
+		mode = (mode + 1) % 4;
 		g_motApply = mode >= 1;
 		g_motEval = mode >= 2;
-		Log("F2: animacion del clon = modo %d (%s)", mode, mode == 0 ? "apagada" : (mode == 1 ? "solo escribir datos" : "escribir y evaluar la pose"));
-		Beep(400 + mode * 250, 120);
+		g_motSubEval = (mode != 3);
+		Log("F2: animacion del clon = modo %d (%s)", mode, mode == 0 ? "apagada" : (mode == 1 ? "solo escribir datos" : (mode == 2 ? "evaluar las dos capas" : "evaluar solo la capa principal")));
+		Beep(350 + mode * 200, 120);
 	}
 	s_f2Prev = f2;
 	bool f3 = focused && (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
@@ -2780,7 +2822,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3z (v5 MotionSet del juego) iniciado");
+	Log("RE4 Coop - hito 3z2 (v5 diagnostico de partes del cuerpo) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 

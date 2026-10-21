@@ -1278,14 +1278,24 @@ static void ReadMotionAt(uintptr_t em, uintptr_t infoOff, MotPart* m)
 			if (tbl[i] == fcv) { m->tblIdx = (int16_t)i; m->tblSel = (uint8_t)sel; hit = true; break; }
 		if (hit) break;
 	}
+	{
+		uint32_t pmb = 0;
+		SafeRead(em + 0x2A8, &pmb, 4);
+		m->pad[0] = (pmb == (uint32_t)(em + infoOff)) ? 1 : 0; // la capa esta "enchufada" como pMotionB del personaje
+	}
 	m->valid = 1;
 }
 
 static void ReadMotion(uintptr_t em, MotPart* m) { ReadMotionAt(em, EM_MOTION, m); }
 
 // Busca MotionMoveCore (pEm, pInfo): el patron de re4_tweaks cae dentro de la funcion; se retrocede hasta su inicio.
+static uintptr_t g_motSetFn = 0;   // MotionSet(pEm, pInfo, clip, seq, hokan, attr, frameInicial, flag): prepara un clip para usarlo (cdecl, 8 argumentos)
+
 static void FindMotionMove()
 {
+	// MotionSet esta en 0x6611A0 del exe de Steam (estudiado desde bio4.exe); se busca por bytes porque la direccion cambia con ASLR.
+	g_motSetFn = FindPattern("Preparar animacion (MotionSet)",
+		"55 8B EC 83 EC 5C A1 ? ? ? ? 33 C5 89 45 FC 8B 45 08 53 56 8B 75 0C 33 C9 33 D2 F7 46 44 00 00 00 20");
 	uintptr_t hit = FindPattern("MotionMoveCore (dentro)", "8A 45 88 A8 02 0F 84 ? ? ? ? D9 85 70 FF FF FF DD 05 ? ? ? ? D8 C1 D9 85 74 FF FF FF DE D9 DF E0 F6 C4 05 7B ? 80 7D 90 00 74 ? 80 7D 8F 00 75");
 	if (!hit) return;
 	static uint8_t buf[0x1800];
@@ -1377,6 +1387,43 @@ static bool CallMotionMove(uintptr_t em, uintptr_t info)
 	}
 }
 
+// Llama a MotionSet (cdecl, 8 argumentos). Es la funcion que usa el propio juego para empezar un clip: deja bien los punteros,
+// "arregla" (suma la base a) los datos del clip la primera vez que se usa en esta PC, y prepara el mezclado con la pose anterior.
+static bool CallMotionSet(uintptr_t em, uintptr_t info, uint32_t fcv, uint32_t hokan, uint32_t attr, float frame)
+{
+	if (!g_motSetFn) return false;
+#if defined(_MSC_VER) && defined(_M_IX86)
+	DWORD fnV = (DWORD)g_motSetFn, emV = (DWORD)em, infoV = (DWORD)info, fcvV = (DWORD)fcv, hokanV = (DWORD)hokan, attrV = (DWORD)attr;
+	DWORD frameBits = 0;
+	memcpy(&frameBits, &frame, 4);
+	__try
+	{
+		__asm
+		{
+			mov esi, esp
+			push 0
+			push frameBits
+			push attrV
+			push hokanV
+			push 0
+			push fcvV
+			push infoV
+			push emV
+			call fnV
+			mov esp, esi
+		}
+		return true;
+	}
+	__except (MotFilter(GetExceptionInformation()))
+	{
+		return false;
+	}
+#else
+	(void)em; (void)info; (void)fcv; (void)hokan; (void)attr; (void)frame;
+	return false;
+#endif
+}
+
 // Lado que recibe: escribe la animacion del otro jugador en el clon y evalua la pose. Dos capas: 0 = principal, 1 = secundaria.
 struct MotLayer
 {
@@ -1386,7 +1433,7 @@ struct MotLayer
 	uint32_t fcv;
 	float frame;
 	uint32_t lastStamp;
-	int clipChanges, hashFail, evalOk, evalFail, skipped;
+	int clipChanges, hashFail, evalOk, evalFail, skipped, setOk, setFail;
 };
 static MotLayer g_motL[2];
 static int g_motViaIdx = 0, g_motNoTbl = 0;
@@ -1440,8 +1487,24 @@ static void MotionApplyLayer(int layer, uintptr_t em, uintptr_t infoOff, const M
 				Log("MOTION[%d]: no pude encontrar el clip del otro jugador (dFcv=%d idx=%d hash=%08X max=%.0f)", layer, (int)p.dFcv, (int)p.tblIdx,
 					(unsigned)p.hash, p.frameMax);
 		}
+		else if (g_motSetFn && CallMotionSet(em, info, L.fcv, 3, (uint32_t)(p.attr & 0xFF), p.frame))
+		{
+			L.setOk++;
+			L.frame = p.frame;
+			L.lastStamp = stamp;
+			if (L.clipChanges <= 6)
+				Log("MOTION[%d]: clip nuevo preparado con MotionSet (fcv=0x%08X max=%.0f juntas=%d attr=0x%04X)", layer, (unsigned)L.fcv, p.frameMax,
+					(int)p.jointNum, (unsigned)p.attr);
+		}
 		else
 		{
+			if (g_motSetFn)
+			{
+				L.setFail++;
+				if (L.setFail <= 4)
+					Log("MOTION[%d]: fallo MotionSet (codigo 0x%08X en 0x%08X) clip fcv=0x%08X; se usa el metodo manual", layer, (unsigned)g_motExCode,
+						(unsigned)g_motExAddr, (unsigned)L.fcv);
+			}
 			uint32_t herm = L.fcv + (uint32_t)(p.dHerm - p.dFcv);
 			uint32_t jno = L.fcv + (uint32_t)(p.dJno - p.dFcv);
 			uint32_t jk = L.fcv + (uint32_t)(p.dJkind - p.dFcv);
@@ -1454,6 +1517,18 @@ static void MotionApplyLayer(int layer, uintptr_t em, uintptr_t infoOff, const M
 			SafeWrite(info + 0x30, &p.jointNum, 1);
 			SafeWrite(info + 0x34, &jno, 4);
 			SafeWrite(info + 0x38, &jk, 4);
+			{
+				// Lo que hace MotionSet con los datos del clip: si todavia son distancias (menores que la direccion del clip), se les suma la base.
+				uint32_t first = 0;
+				if (SafeRead(herm, &first, 4) && first < L.fcv)
+					for (int i = 0; i < (int)p.jointNum; i++)
+					{
+						uint32_t v = 0;
+						if (!SafeRead(herm + i * 4, &v, 4)) break;
+						v += L.fcv;
+						SafeWrite(herm + i * 4, &v, 4);
+					}
+			}
 			L.frame = p.frame;
 			L.lastStamp = stamp;
 			if (L.clipChanges <= 6)
@@ -1527,7 +1602,13 @@ static void MotionApply(const RemoteSnap& snap, float dt)
 		if (anchor < 0x10000) { g_motNoTbl++; return; }
 	}
 	MotionApplyLayer(0, em, EM_MOTION, snap.mot, snap.motStamp, anchor, dt);
-	if (g_motSub) MotionApplyLayer(1, em, EM_SUBMOT, snap.sub, snap.motStamp, anchor, dt);
+	if (g_motSub)
+	{
+		MotionApplyLayer(1, em, EM_SUBMOT, snap.sub, snap.motStamp, anchor, dt);
+		// Igual que en el otro PC: la segunda capa esta enchufada (pMotionB) o no. MotionSet lo borra, por eso se vuelve a poner.
+		uint32_t pmb = (snap.sub.valid && snap.sub.pad[0] && g_motL[1].clipOk) ? (uint32_t)(em + EM_SUBMOT) : 0;
+		SafeWrite(em + 0x2A8, &pmb, 4);
+	}
 }
 
 // Una linea por segundo (y un volcado de las tablas la primera vez) para entender como se identifican los clips.
@@ -1570,9 +1651,9 @@ static void MotionLog()
 	for (int ly = 0; ly < 2; ly++)
 	{
 		const MotLayer& L = g_motL[ly];
-		Log("MOTION-CLON[%d]: aplicar=%d evaluar=%d recibido=%d clipOk=%d aplicado=%d clipsNuevos=%d fallaHash=%d porIndice=%d evalOk=%d evalFalla=%d omitidos=%d malos=%d frame=%.1f",
+		Log("MOTION-CLON[%d]: aplicar=%d evaluar=%d recibido=%d clipOk=%d aplicado=%d clipsNuevos=%d fallaHash=%d porIndice=%d evalOk=%d evalFalla=%d omitidos=%d malos=%d setOk=%d setFalla=%d frame=%.1f",
 			ly, (int)g_motApply, (int)g_motEval, (int)(ly ? rs.sub.valid : rs.mot.valid), (int)L.clipOk, g_motApplied, L.clipChanges, L.hashFail, g_motViaIdx,
-			L.evalOk, L.evalFail, L.skipped, g_motBadN[ly], L.frame);
+			L.evalOk, L.evalFail, L.skipped, g_motBadN[ly], L.setOk, L.setFail, L.frame);
 	}
 	if (le > 0x10000)
 	{
@@ -2699,7 +2780,7 @@ static uint16_t ReadRoomNow()
 void ModMain()
 {
 	LogOpen();
-	Log("RE4 Coop - hito 3y (v5 dos capas de animacion) iniciado");
+	Log("RE4 Coop - hito 3z (v5 MotionSet del juego) iniciado");
 	InitializeCriticalSection(&g_remoteLock);
 	InitializeCriticalSection(&g_reqLock);
 
